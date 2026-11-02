@@ -69,7 +69,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(summary["accepted"] + summary["rejected"], counts["check"])
             self.assertEqual(summary["accepted"], counts["check"])
             self.assertEqual(summary["rejected"], 0)
-            self.assertEqual(summary["checker"], "PassThroughChecker")
+            self.assertEqual(summary["checker"], "Checker")
             self.assertEqual(summary["sent_bytes"], sum(
                 e["bytes"] for e in events if e["type"] == "packet_sent"))
             self.assertEqual(summary["received_bytes"], sum(

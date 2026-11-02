@@ -1,16 +1,15 @@
 """S1 run: signed observations through PacketTransport to an ego checker.
 
-Default checker is PassThroughChecker. Reviewer swap at merge:
-
-    from coopx.checker import Checker
-    run_s1(..., checker=Checker(anchors, ttl_us=1_000_000))
+Default checker is the deterministic `coopx.checker.Checker` built from the
+run's trust anchors. `PassThroughChecker` remains available for transport-only
+debugging (`checker=PassThroughChecker()`).
 """
 
 from collections import Counter
-from dataclasses import dataclass
 import json
 from pathlib import Path
 
+from coopx.checker import Checker, CheckResult
 from coopx.domain import ObjectClass, Observation, PositionAnchor
 from coopx.envelope import Auth, Envelope, Lineage, ObservationMessage, decode, encode, sign
 from coopx.identity import NodeKey, TrustAnchor, TrustClass
@@ -24,15 +23,8 @@ S1_FRAME = "site_map"
 S1_SESSION = "s1"
 
 
-@dataclass(frozen=True, slots=True)
-class CheckResult:
-    codes: tuple[str, ...]
-    state: str
-    message: ObservationMessage | None
-
-
 class PassThroughChecker:
-    """Accepts any decodable packet. Same check(raw, now_us) shape as Agent A's Checker."""
+    """Accepts any decodable packet; transport debugging only. Same shape as Checker."""
 
     def check(self, raw: bytes, now_us: int) -> CheckResult:
         try:
@@ -121,12 +113,12 @@ def _handle_deliveries(deliveries, checker, events: list[dict]) -> tuple[int, in
 def run_s1(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 100_000,
            jitter_us: int = 50_000, disconnect_at_us: int | None = None,
            checker=None) -> dict:
-    """Replay ~5 s at 10 Hz. `checker=` defaults to PassThroughChecker (merge seam)."""
+    """Replay ~5 s at 10 Hz. `checker=` defaults to the real Checker over this run's anchors."""
     if disconnect_at_us is not None and (type(disconnect_at_us) is not int or disconnect_at_us < 0):
         raise ValueError("disconnect_at_us must be a nonnegative int")
     keys, anchors = _anchors_and_keys()
     if checker is None:
-        checker = PassThroughChecker()  # swap: Checker(anchors, ttl_us=S1_TTL_US)
+        checker = Checker(anchors, ttl_us=S1_TTL_US)
     events: list[dict] = []
     transport = PacketTransport(
         S1_NODES, delay_us=delay_us, jitter_us=jitter_us, loss_probability=loss,
