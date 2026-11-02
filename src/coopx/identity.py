@@ -44,6 +44,9 @@ class TrustAnchor:
     # xmin,ymin,zmin,xmax,ymax,zmax in the configured spatial frame.
     permitted_region: tuple[float, float, float, float, float, float] | None = None
     common_causes: tuple[str, ...] = ()
+    # Receiver-established physical binding, never taken from a sender's claim.
+    # A configured body name alone does not anchor a class-B pseudonym.
+    anchored: bool = False
 
     def __post_init__(self):
         Ed25519PublicKey.from_public_bytes(self.public_key)
@@ -57,6 +60,8 @@ class TrustAnchor:
                 raise ValueError("invalid permitted region")
         if any(not c for c in self.common_causes):
             raise ValueError("common cause identifiers must be nonempty")
+        if type(self.anchored) is not bool:
+            raise ValueError("anchored must be a boolean")
 
     def permits(self, xyz: tuple[float, float, float]) -> bool:
         return len(xyz) == 3 and all(math.isfinite(v) for v in xyz) and (
