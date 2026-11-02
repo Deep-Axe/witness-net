@@ -86,7 +86,7 @@ consumer) and its viewer:
 
 ```sh
 .venv/bin/python -m coopx s1 --output data/s1-events.jsonl --loss 0.1 --jitter-us 150000 --disconnect-at-us 3000000
-python3 -m http.server 8765
+.venv/bin/python scripts/serve_ui.py      # localhost only; serves ui/ and data/*.jsonl, never .env
 # open http://127.0.0.1:8765/ui/index.html?log=/data/s1-events.jsonl
 ```
 
