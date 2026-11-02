@@ -58,11 +58,13 @@ Details: [protocol draft](docs/protocol.md) ·
 | Compact object record (CX1, 84 bytes), delayed transport, stale detection, depth lifting | Implemented on synthetic data |
 | CX2 signed observations, Ed25519 identities, authenticated lineage and witness accounting | Implemented; round-trip, tampering, relay and dependency tests pass |
 | Meta API access (Spark JSON + function calls, SAM image/video, Voice) | Verified with small probes; not yet integrated |
-| Coverage, deterministic checker, S1 transport/event log/UI integration | Next |
+| Deterministic checker (signature, freshness, future time, duplicates, bounded replay window, bounds) | Implemented; honest reordered traffic accepted, replay/forgery rejected |
+| S1 slice: signed observations → packet transport (delay, jitter, loss, disconnect) → checker → JSONL event log → browser viewer | Implemented; backend tested end to end, viewer skeleton only |
+| Coverage, free space, contested regions | Next (S2) |
 | V2X-Real reader and projection calibration | Implemented; three frames, six cameras, and RSU → vehicle projections inspected; capture synchronization unproven |
-| Tests | 38 passing: 16 original, 7 dataset/geometry, 15 signed-message |
+| Tests | 81 passing |
 | Dataset replay ([V2X-Real](https://mobility-lab.seas.ucla.edu/v2x-real/) validation split) | Data extracted; replay integration pending |
-| Muse Reasoner, SAM observer, attacks, evaluation, demo UI | Not started |
+| Muse Reasoner, SAM observer, attacks, evaluation, full demo UI | Not started |
 
 A successful synthetic run does not imply the dataset or model integrations work.
 
@@ -77,6 +79,15 @@ uv pip install --python .venv/bin/python --editable .
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m coopx synthetic --output data/example-events.jsonl
 .venv/bin/python -m coopx replay-packets data/example-events.jsonl
+```
+
+Slice S1 (signed observations through a lossy, jittery link to a checking
+consumer) and its viewer:
+
+```sh
+.venv/bin/python -m coopx s1 --output data/s1-events.jsonl --loss 0.1 --jitter-us 150000 --disconnect-at-us 3000000
+python3 -m http.server 8765
+# open http://127.0.0.1:8765/ui/index.html?log=/data/s1-events.jsonl
 ```
 
 No API key or credits are needed for these checks. The synthetic command

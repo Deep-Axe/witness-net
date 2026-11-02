@@ -3,8 +3,11 @@
 **Status:** design draft, updated 2026-11-03. Implemented: CX1 object records
 (`src/coopx/radio_codec.py`), signed CX2 observation envelopes and authenticated
 lineage (`src/coopx/envelope.py`), Ed25519 identities and trust-anchor metadata
-(`src/coopx/identity.py`). Other message-body codecs, the deterministic checker,
-replay protection and runtime integration remain specified, not built.
+(`src/coopx/identity.py`), claim-scoped witness counting, the deterministic
+admission checker with a bounded replay window (`src/coopx/checker.py`), and a
+binary packet transport with an end-to-end S1 run (`src/coopx/pipeline.py`).
+Other message-body codecs (coverage, query, answer, verdict, capability, label
+table), coverage/free-space checks and advisories remain specified, not built.
 
 > Give any robot access to the senses around it. Machines discover observers,
 > ask about the world, and cross-check the answers, even when the robot has no
