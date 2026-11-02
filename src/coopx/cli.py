@@ -86,9 +86,24 @@ def main() -> None:
     smoke.add_argument("--output", type=Path, required=True, help="New JSONL file; existing files are preserved")
     replay = sub.add_parser("replay-packets", help="Decode received packets from a synthetic event log")
     replay.add_argument("events", type=Path)
+    s1 = sub.add_parser("s1", help="S1: signed observations through packet transport to ego")
+    s1.add_argument("--output", type=Path, required=True, help="New JSONL file; existing files are preserved")
+    s1.add_argument("--seed", type=int, default=0)
+    s1.add_argument("--loss", type=float, default=0.1)
+    s1.add_argument("--delay-us", type=int, default=100_000)
+    s1.add_argument("--jitter-us", type=int, default=50_000)
+    s1.add_argument("--disconnect-at-us", type=int, default=None)
     args = parser.parse_args()
     try:
-        result = synthetic(args.output) if args.command == "synthetic" else replay_packets(args.events)
+        if args.command == "synthetic":
+            result = synthetic(args.output)
+        elif args.command == "replay-packets":
+            result = replay_packets(args.events)
+        else:
+            from coopx.pipeline import run_s1
+            result = run_s1(args.output, seed=args.seed, loss=args.loss,
+                            delay_us=args.delay_us, jitter_us=args.jitter_us,
+                            disconnect_at_us=args.disconnect_at_us)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"coopx: {exc}\n")
     print(json.dumps(result, indent=2, allow_nan=False))
