@@ -8,10 +8,11 @@ import base64
 from dataclasses import dataclass, replace
 from enum import IntEnum
 import hashlib
+import math
 import struct
-from typing import Iterable
+from typing import Callable, Iterable
 
-from coopx.domain import Observation, uint
+from coopx.domain import ObjectClass, Observation, uint
 from coopx.identity import NodeKey, TrustAnchors, TrustClass
 from coopx import radio_codec
 
@@ -235,6 +236,30 @@ def byte_accounting(message: ObservationMessage) -> dict[str, int | str]:
             "signature": 64, "key_ref": key_ref, "object_body": radio_codec.RECORD.size,
             "envelope_and_lineage": total - 64 - key_ref - radio_codec.RECORD.size}
 
+
+def default_agrees(root_message: ObservationMessage, claim: ObservationMessage) -> bool:
+    """Conservative point agreement, not proof of truth or object identity.
+
+    Positions must share a spatial frame and anchor; no surface/centre
+    conversion is inferred. UNKNOWN cannot confirm a known semantic class.
+    Dynamic labels must match (their table must be shared by the caller).
+    Gates are inclusive: 300ms and 1.5m, or 3m for vehicles. Only the root's
+    own velocity widens its gate: a claimant cannot invent speed to borrow an
+    unrelated root. Callers may supply a geometry-specific agreement policy.
+    """
+    root, target = root_message.observation, claim.observation
+    if (root_message.envelope.spatial_frame_id != claim.envelope.spatial_frame_id
+            or root.anchor != target.anchor or root.cls != target.cls
+            or root_message.label_id != claim.label_id):
+        return False
+    elapsed_us = abs(root.captured_sim_us - target.captured_sim_us)
+    if elapsed_us > 300_000:
+        return False
+    gate_m = 3.0 if root.cls == ObjectClass.VEHICLE else 1.5
+    if root.velocity_mps is not None:
+        gate_m += math.hypot(*root.velocity_mps) * elapsed_us / 1_000_000
+    return math.dist(root.xyz_m, target.xyz_m) <= gate_m
+
 class EvidenceStore:
     """Content-addressed authenticated packets, with a snapshot of trust anchors."""
     def __init__(self, anchors: TrustAnchors):
@@ -289,12 +314,18 @@ class EvidenceStore:
             return set(roots) if l.derivation == "relayed" else set(dependencies) | set(roots)
         return frozenset(resolve(message, set()) or ())
 
-    def independent_witnesses(self, messages: Iterable[ObservationMessage]) -> int:
-        """Count independent provenance groups after caller's relevance checks.
+    def independent_witnesses(
+        self, claim: ObservationMessage, messages: Iterable[ObservationMessage],
+        agrees: Callable[[ObservationMessage, ObservationMessage], bool] = default_agrees,
+    ) -> int:
+        """Count authenticated provenance groups whose OWN content supports claim.
 
         Same-body roots, shared ancestor roots and configured common causes
         collapse. No physical association or unresolved origin gives no credit.
-        This does not establish agreement, truth or relevance to a claim.
+        A lineage reference alone is not support. Class-B roots require a
+        receiver-established physical anchor; D never earns credit. This
+        still does not establish truth, coverage, permission or freshness
+        against the consumer's clock; the checker handles those separately.
         """
         groups: list[set[str]] = []
         roots_to_messages = {}
@@ -308,7 +339,9 @@ class EvidenceStore:
         # measurements in a fusion/verdict must not erase their independence.
         for ref, root in roots_to_messages.items():
             anchor = self.anchors[root.envelope.source_id]
-            if anchor.trust_class == TrustClass.D or anchor.physical_observer is None:
+            if (anchor.trust_class == TrustClass.D or anchor.physical_observer is None
+                    or (anchor.trust_class == TrustClass.B and not anchor.anchored)
+                    or not agrees(root, claim)):
                 continue
             tokens = {"body:" + anchor.physical_observer, "root:" + ref}
             tokens.update("cause:" + cause for cause in anchor.common_causes)

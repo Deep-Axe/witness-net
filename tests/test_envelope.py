@@ -1,10 +1,10 @@
 from dataclasses import replace
 import unittest
 
-from coopx.domain import ObjectClass, Observation
+from coopx.domain import ObjectClass, Observation, PositionAnchor
 from coopx.envelope import (Auth, Envelope, Lineage, ObservationMessage, Geometry,
                            EvidenceStore, sign, encode, decode, verify,
-                           evidence_ref, byte_accounting)
+                           evidence_ref, byte_accounting, default_agrees)
 from coopx.identity import NodeKey, TrustAnchor, TrustClass
 
 class EnvelopeTests(unittest.TestCase):
@@ -32,6 +32,18 @@ class EnvelopeTests(unittest.TestCase):
         return sign(replace(original, envelope=e, lineage=l,
                             observation=replace(original.observation, source="relay")),
                     self.keys["relay"])
+
+    def alter_observation(self, message, **changes):
+        observation = replace(message.observation, **changes)
+        capture = observation.captured_sim_us
+        envelope = replace(message.envelope, capture_time_us=capture,
+                           generation_time_us=max(capture, message.envelope.generation_time_us),
+                           valid_until_us=max(capture, message.envelope.generation_time_us) + 1_000_000)
+        lineage = message.lineage
+        if lineage.derivation == "direct":
+            lineage = replace(lineage, origin_capture_time_us=capture)
+        return sign(replace(message, observation=observation, envelope=envelope,
+                            lineage=lineage), self.keys[envelope.source_id])
 
     def test_roundtrip_signature_and_full_accounting(self):
         message = self.original(label_id=0)
@@ -73,13 +85,13 @@ class EnvelopeTests(unittest.TestCase):
             self.store.add(r)
             self.assertEqual(self.store.authenticated_roots(r), {evidence_ref(original)})
             self.assertEqual(decode(encode(r)).lineage.root_ref, evidence_ref(original))
-        self.assertEqual(self.store.independent_witnesses([original]+relays), 1)
+        self.assertEqual(self.store.independent_witnesses(original, [original]+relays), 1)
 
     def test_missing_original_fabricated_origin_or_modified_relay_no_credit(self):
         original = self.original()
         relay = self.relay(original)
         self.store.add(relay)
-        self.assertEqual(self.store.independent_witnesses([relay]), 0)
+        self.assertEqual(self.store.independent_witnesses(original, [relay]), 0)
         self.store.add(original)
         fake = self.relay(original, origin_observer="other")
         self.assertEqual(self.store.authenticated_roots(fake), set())
@@ -92,36 +104,36 @@ class EnvelopeTests(unittest.TestCase):
         frames = [self.original(mid=f"f{i}", seq=i) for i in range(10)]
         for message in frames:
             self.store.add(message)
-        self.assertEqual(self.store.independent_witnesses(frames), 1)
+        self.assertEqual(self.store.independent_witnesses(frames[-1], frames), 1)
 
     def test_lidar_lift_and_same_lidar_one_witness(self):
         lidar = self.original(mid="lidar1", sensor="lidar")
         ref = self.store.add(lidar)
         camera = self.original(mid="camera1", parents=(ref,))
         self.store.add(camera)
-        self.assertEqual(self.store.independent_witnesses([camera, lidar]), 1)
+        self.assertEqual(self.store.independent_witnesses(camera, [camera, lidar]), 1)
 
     def test_independent_observers_and_shared_causes(self):
         pole, car = self.original(), self.original("car")
         for message in (pole, car):
             self.store.add(message)
-        self.assertEqual(self.store.independent_witnesses([pole, car]), 2)
+        self.assertEqual(self.store.independent_witnesses(pole, [pole, car]), 2)
         anchors = {s: replace(a, common_causes=("upstream-camera",)) for s, a in self.anchors.items()}
         shared = EvidenceStore(anchors)
         shared.add(pole)
         shared.add(car)
-        self.assertEqual(shared.independent_witnesses([pole, car]), 1)
+        self.assertEqual(shared.independent_witnesses(pole, [pole, car]), 1)
 
     def test_unanchored_peer_and_class_d_have_zero_weight(self):
         pole = self.original()
         anchors = {"pole": replace(self.anchors["pole"], physical_observer=None, trust_class=TrustClass.B)}
         store = EvidenceStore(anchors)
         store.add(pole)
-        self.assertEqual(store.independent_witnesses([pole]), 0)
+        self.assertEqual(store.independent_witnesses(pole, [pole]), 0)
         anchors["pole"] = replace(self.anchors["pole"], trust_class=TrustClass.D)
         store = EvidenceStore(anchors)
         store.add(pole)
-        self.assertEqual(store.independent_witnesses([pole]), 0)
+        self.assertEqual(store.independent_witnesses(pole, [pole]), 0)
 
     def test_bad_wire_truncation_trailing_flags_and_canonical_null(self):
         raw = encode(self.original())
@@ -157,12 +169,12 @@ class EnvelopeTests(unittest.TestCase):
         fused = sign(replace(fused, lineage=replace(
             fused.lineage, derivation="fused", parents=(car_ref,))), self.keys["relay"])
         self.store.add(fused)
-        self.assertEqual(self.store.independent_witnesses([fused]), 2)
+        self.assertEqual(self.store.independent_witnesses(fused, [fused]), 2)
         # A measurement derived using another observer's evidence is correlated
         # with that upstream observer, even though its signer is different.
         derived = self.original("car", mid="derived", parents=(pole_ref,))
         self.store.add(derived)
-        self.assertEqual(self.store.independent_witnesses([derived, pole]), 1)
+        self.assertEqual(self.store.independent_witnesses(derived, [derived, pole]), 1)
 
     def test_relay_extra_parents_cannot_manufacture_witnesses(self):
         pole, car = self.original(), self.original("car")
@@ -170,7 +182,7 @@ class EnvelopeTests(unittest.TestCase):
         ref = self.store.add(car)
         relay = self.relay(pole, parents=(ref,))
         self.store.add(relay)
-        self.assertEqual(self.store.independent_witnesses([relay]), 1)
+        self.assertEqual(self.store.independent_witnesses(pole, [relay]), 1)
 
     def test_multiple_trusted_identities_one_physical_observer(self):
         anchors = {s: replace(a, physical_observer="one-body") for s, a in self.anchors.items()}
@@ -178,12 +190,107 @@ class EnvelopeTests(unittest.TestCase):
         messages = [self.original(s) for s in self.keys]
         for message in messages:
             store.add(message)
-        self.assertEqual(store.independent_witnesses(messages), 1)
+        self.assertEqual(store.independent_witnesses(messages[0], messages), 1)
 
     def test_missing_parent_fails_closed(self):
         message = self.original(parents=("0"*64,))
         self.store.add(message)
         self.assertEqual(self.store.authenticated_roots(message), set())
+
+    def test_lineage_cannot_launder_unrelated_content_into_witness_credit(self):
+        pole = self.original()
+        self.store.add(pole)
+        tracked = self.relay(pole)
+        tracked = self.alter_observation(replace(tracked, lineage=replace(
+            tracked.lineage, derivation="tracked")), xyz_m=(40., -20., 1.))
+        self.store.add(tracked)
+        ghost = self.alter_observation(self.original("relay", mid="ghost"),
+                                       xyz_m=(40., -20., 1.))
+        self.store.add(ghost)
+        self.assertEqual(self.store.independent_witnesses(tracked, [tracked]), 0)
+        self.assertEqual(self.store.independent_witnesses(tracked, [tracked, ghost]), 1)
+        self.assertEqual(self.store.independent_witnesses(pole, [pole]), 1)
+        self.assertEqual(self.store.independent_witnesses(pole, [pole, self.original("car")]), 2)
+
+    def test_legitimate_fusion_can_differ_from_its_supporting_roots(self):
+        pole = self.original()
+        car = self.alter_observation(self.original("car"), xyz_m=(11., 2., 1.))
+        self.store.add(pole)
+        car_ref = self.store.add(car)
+        fused = self.relay(pole)
+        fused = replace(fused, lineage=replace(fused.lineage, derivation="fused", parents=(car_ref,)))
+        fused = self.alter_observation(fused, xyz_m=(10.5, 2., 1.))
+        self.assertEqual(self.store.independent_witnesses(fused, [fused]), 2)
+
+    def test_default_agreement_time_class_distance_and_velocity_gates(self):
+        root = self.original()
+        on_edge = self.alter_observation(root, xyz_m=(11.5, 2., 1.), captured_sim_us=301001)
+        self.assertTrue(default_agrees(root, on_edge))
+        self.assertFalse(default_agrees(root, self.alter_observation(on_edge, captured_sim_us=301002)))
+        self.assertFalse(default_agrees(root, self.alter_observation(root, xyz_m=(11.501, 2., 1.))))
+        self.assertFalse(default_agrees(root, self.alter_observation(root, xyz_m=(10., 2., 2.501))))
+        self.assertFalse(default_agrees(root, self.alter_observation(root, cls=ObjectClass.CYCLIST)))
+        car = self.alter_observation(root, cls=ObjectClass.VEHICLE)
+        self.assertTrue(default_agrees(car, self.alter_observation(car, xyz_m=(13., 2., 1.))))
+        self.assertFalse(default_agrees(car, self.alter_observation(car, xyz_m=(13.001, 2., 1.))))
+        moving = self.alter_observation(root, velocity_mps=(10., 0., 0.))
+        later = self.alter_observation(root, captured_sim_us=201001, xyz_m=(13.4, 2., 1.))
+        self.assertTrue(default_agrees(moving, later))
+        self.assertFalse(default_agrees(root, later))
+        # An invented velocity on the derived claim cannot widen a genuine root.
+        self.assertFalse(default_agrees(root, self.alter_observation(later, velocity_mps=(1e6, 0., 0.))))
+
+    def test_default_agreement_rejects_incompatible_frame_anchor_and_label(self):
+        root = self.original(label_id=7)
+        self.assertFalse(default_agrees(root, replace(root, label_id=8)))
+        self.assertFalse(default_agrees(root, replace(root, label_id=None)))
+        self.assertFalse(default_agrees(root, replace(root, envelope=replace(
+            root.envelope, spatial_frame_id="different_map"))))
+        self.assertFalse(default_agrees(root, self.alter_observation(root, anchor=PositionAnchor.CENTRE)))
+        unknown = self.alter_observation(root, cls=ObjectClass.UNKNOWN)
+        self.assertFalse(default_agrees(unknown, root))
+
+    def test_custom_agreement_receives_original_content(self):
+        root = self.original()
+        self.store.add(root)
+        derived = self.relay(root)
+        derived = self.alter_observation(replace(derived, lineage=replace(
+            derived.lineage, derivation="tracked")), xyz_m=(40., -20., 1.))
+        seen = []
+        def agrees(original, claim):
+            seen.append((original.observation.xyz_m, claim.observation.xyz_m))
+            return original.observation.xyz_m == claim.observation.xyz_m
+        self.assertEqual(self.store.independent_witnesses(derived, [derived], agrees), 0)
+        self.assertEqual(seen, [(root.observation.xyz_m, derived.observation.xyz_m)])
+
+    def test_configured_class_b_sybils_need_receiver_established_anchoring(self):
+        messages = []
+        anchors = {}
+        for index in range(5):
+            source = f"sybil-{index}"
+            self.keys[source] = NodeKey.generate()
+            anchors[source] = TrustAnchor(self.keys[source].public_key, source+"-key", TrustClass.B,
+                                           physical_observer=f"body-{index}")
+            messages.append(self.original(source))
+        store = EvidenceStore(anchors)
+        for message in messages:
+            store.add(message)
+        self.assertEqual(store.independent_witnesses(messages[0], messages), 0)
+        anchored = EvidenceStore({source: replace(anchor, anchored=True) for source, anchor in anchors.items()})
+        for message in messages:
+            anchored.add(message)
+        self.assertEqual(anchored.independent_witnesses(messages[0], messages), 5)
+        same_body = EvidenceStore({source: replace(anchor, anchored=True, physical_observer="one-body")
+                                   for source, anchor in anchors.items()})
+        self.assertEqual(same_body.independent_witnesses(messages[0], messages), 1)
+        class_d = EvidenceStore({source: replace(anchor, anchored=True, trust_class=TrustClass.D)
+                                 for source, anchor in anchors.items()})
+        self.assertEqual(class_d.independent_witnesses(messages[0], messages), 0)
+        class_c = EvidenceStore({source: replace(anchor, trust_class=TrustClass.C)
+                                 for source, anchor in anchors.items()})
+        self.assertEqual(class_c.independent_witnesses(messages[0], messages), 5)
+        with self.assertRaises(ValueError):
+            replace(next(iter(anchors.values())), anchored="yes")
 
 if __name__ == "__main__":
     unittest.main()
