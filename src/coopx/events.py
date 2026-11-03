@@ -9,7 +9,15 @@ EVENT_TYPES = frozenset({
     "observation_published", "packet_sent", "packet_dropped", "packet_delivered",
     "check", "observer_disconnected", "observer_reconnected",
     "coverage_published", "assessment", "map_snapshot",
+    "query", "answer", "verdict", "model_call",
 })
+# S3 (contract 5): Reasoner queries, observer answers, verdicts, paid-model calls.
+QUERY_TIERS = ("T0", "T1", "T2", "T3")
+ANSWER_RESULTS = ("detected", "not_detected", "observed_free", "not_covered",
+                  "unsupported", "unavailable")
+VERDICT_STATES = ("corroborated", "contradicted", "unverified", "contested")
+MODEL_PRODUCTS = ("muse-spark-1.3", "sam-3.1", "muse-voice-transcribe-1.0")
+MODEL_STAGES = ("plan", "judge", "verify", "segment", "transcribe")
 CHECK_CODES = (
     "OK", "DECODE_ERROR", "UNKNOWN_SOURCE", "KEY_MISMATCH", "BAD_SIGNATURE",
     "STALE", "EXPIRED", "FUTURE_TIME", "DUPLICATE", "OUTSIDE_REPLAY_WINDOW",
@@ -145,6 +153,78 @@ def _s2_detail(d):
                     raise ValueError("a contested cell needs both a free and an occupied claim")
 
 
+def _number(value, low=0.0):
+    return type(value) in (int, float) and math.isfinite(value) and value >= low
+
+
+def _refs(values, name):
+    if (type(values) is not list or any(not _reference(ref) for ref in values)
+            or len(set(values)) != len(values)):
+        raise ValueError(f"{name} must be unique SHA-256 strings")
+    return values
+
+
+def _s3_detail(d):
+    """Contract 5. Free text (reason, concept) is data for display, never instructions."""
+    detail, kind = d["detail"], d["type"]
+    if kind == "query":
+        if (d["message_type"] != "query" or d["message_id"] is None or d["dest_id"] is None
+                or not {"tier", "region", "time_us", "concept", "reason"} <= detail.keys()):
+            raise ValueError("query needs query_id (message_id), observer (dest_id) and detail")
+        region = detail["region"]
+        if (detail["tier"] not in QUERY_TIERS or type(region) is not dict
+                or set(region) != {"center", "radius_m"} or type(region["center"]) is not list
+                or len(region["center"]) != 2 or not all(_number(v, -math.inf) for v in region["center"])
+                or not _number(region["radius_m"]) or region["radius_m"] <= 0
+                or type(detail["time_us"]) is not int or detail["time_us"] < 0
+                or not (detail["concept"] is None or (type(detail["concept"]) is str
+                                                      and 0 < len(detail["concept"]) <= 64))
+                or type(detail["reason"]) is not str):
+            raise ValueError("invalid query tier, region, time, concept or reason")
+    elif kind == "answer":
+        if (d["message_type"] != "answer" or d["message_id"] is None or d["dest_id"] is None
+                or not {"observed_time_us", "coverage_ref", "evidence_refs"} <= detail.keys()):
+            raise ValueError("answer needs query_id (message_id), asker (dest_id) and detail")
+        observed = detail["observed_time_us"]
+        if observed is not None and (type(observed) is not int or observed < 0):
+            raise ValueError("observed_time_us must be a nonnegative integer or null")
+        if detail["coverage_ref"] is not None and not _reference(detail["coverage_ref"]):
+            raise ValueError("coverage_ref must be SHA-256 or null")
+        refs = _refs(detail["evidence_refs"], "evidence_refs")
+        if d["state"] == "detected" and not refs:
+            raise ValueError("detected needs evidence refs")
+        if d["state"] == "observed_free" and detail["coverage_ref"] is None:
+            raise ValueError("observed_free needs the range coverage that proves it")
+    elif kind == "verdict":
+        if (d["message_type"] != "verdict" or d["message_id"] is None
+                or not {"subject", "evidence_refs", "reason", "model_call_ids"} <= detail.keys()):
+            raise ValueError("verdict needs an id and subject/evidence/reason/model calls")
+        refs = _refs(detail["evidence_refs"], "evidence_refs")
+        calls = detail["model_call_ids"]
+        if (type(detail["subject"]) is not str or not detail["subject"].strip()
+                or type(detail["reason"]) is not str
+                or type(calls) is not list or any(type(c) is not str or not c for c in calls)):
+            raise ValueError("invalid verdict subject, reason or model_call_ids")
+        if d["state"] != "unverified" and not refs:
+            raise ValueError("a non-unverified verdict must cite evidence")
+    elif kind == "model_call":
+        keys = {"product", "stage", "cache_hit", "latency_ms", "input_tokens", "output_tokens",
+                "images", "cost_usd", "query_time_us", "availability_time_us", "precomputed"}
+        if d["message_id"] is None or not keys <= detail.keys():
+            raise ValueError("model_call needs a call id (message_id) and accounting detail")
+        if (detail["product"] not in MODEL_PRODUCTS or detail["stage"] not in MODEL_STAGES
+                or type(detail["cache_hit"]) is not bool or type(detail["precomputed"]) is not bool
+                or not _number(detail["latency_ms"]) or not _number(detail["cost_usd"])
+                or any(type(detail[k]) is not int or detail[k] < 0
+                       for k in ("input_tokens", "output_tokens", "images",
+                                 "query_time_us", "availability_time_us"))
+                or detail["availability_time_us"] < detail["query_time_us"]):
+            raise ValueError("invalid model_call accounting")
+        # Time honesty: a model result is logged when it could really exist.
+        if d["t_replay_us"] != detail["availability_time_us"]:
+            raise ValueError("model_call must be logged at its availability time")
+
+
 def validate(d: dict) -> None:
     """Raise ValueError for malformed or inconsistent coopx.events/1 objects."""
     if type(d) is not dict or d.keys() != set(FIELDS):
@@ -181,6 +261,12 @@ def validate(d: dict) -> None:
     elif d["type"] == "assessment":
         if len(codes) != 1 or d["state"] != ASSESSMENT_STATES[codes[0]]:
             raise ValueError("assessment needs exactly one state-consistent assessment code")
+    elif d["type"] == "answer":
+        if codes or d["state"] not in ANSWER_RESULTS:
+            raise ValueError("answer needs empty codes and one of the six results as state")
+    elif d["type"] == "verdict":
+        if codes or d["state"] not in VERDICT_STATES:
+            raise ValueError("verdict needs empty codes and a verdict state")
     elif codes or d["state"] is not None:
         raise ValueError("non-check event needs empty codes and null state")
     if type(d["detail"]) is not dict:
@@ -190,6 +276,7 @@ def validate(d: dict) -> None:
     except RecursionError as exc:
         raise ValueError("detail nesting too deep") from exc
     _s2_detail(d)
+    _s3_detail(d)
 
 
 @dataclass(frozen=True, slots=True)
