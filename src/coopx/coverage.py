@@ -5,7 +5,7 @@ store (also bound by Assessor) for signature/permission checks and trust-aware
 free space. Snapshot lists are disjoint; is_occupied() includes contested cells.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 import struct
 
@@ -48,7 +48,7 @@ class GridSpec:
                 self.origin_x + self.nx * self.cell_m, self.origin_y + self.ny * self.cell_m)
 
     def contains(self, cell):
-        return (type(cell) is tuple and len(cell) == 2 and all(type(i) is int for i in cell)
+        return (type(cell) is tuple and len(cell) == 2 and type(cell[0]) is int and type(cell[1]) is int
                 and 0 <= cell[0] < self.nx and 0 <= cell[1] < self.ny)
 
     def cell_centre(self, cell):
@@ -108,6 +108,7 @@ class CoverageMessage:
     envelope: Envelope
     content: CoverageContent
     lineage: Lineage
+    _wire: bytes | None = field(default=None, init=False, compare=False, repr=False)
 
     def __post_init__(self):
         e, c, l = self.envelope, self.content, self.lineage
@@ -197,6 +198,7 @@ def decode_coverage(raw):
         Lineage(origin, sensor, oid, origin_capture, DERIVATIONS[derivation], parents, root))
     if encode(message) != raw:
         raise ValueError("noncanonical coverage encoding")
+    object.__setattr__(message, "_wire", raw)
     return message
 
 
@@ -247,6 +249,9 @@ class CoverageMap:
         self._cells = {}
         self._observations = {}
         self._now_us = 0
+        self._policy_cache = {}
+        self._origin_auth_cache = {}
+        self._policy_epoch = None
 
     def bind_store(self, store):
         if self.store is not None and self.store is not store:
@@ -288,7 +293,7 @@ class CoverageMap:
                 del self._cells[cell]
 
     def _prepare(self, message, now_us):
-        message = decode(encode(message))
+        message = message if message._wire is not None else decode(encode(message))
         e = message.envelope
         if (type(now_us) is not int or now_us < self._now_us or e.spatial_frame_id != self.spatial_frame_id
                 or not e.capture_time_us <= now_us <= min(e.valid_until_us, e.capture_time_us + self.ttl_us)):
@@ -298,7 +303,7 @@ class CoverageMap:
             bounds = coverage_bounds(message.content) if isinstance(message, CoverageMessage) else (message.observation.xyz_m,)
             if anchor is None or any(not anchor.permits(point) for point in bounds):
                 raise ValueError("map input outside permitted region")
-            self.store.add(message)
+            message = self.store.get(self.store.add(message))
         return message
 
     def add(self, coverage_message, now_us):
@@ -353,9 +358,23 @@ class CoverageMap:
         origin = claim.range_origin
         if origin is None:
             return False
-        anchor = self.store.anchors.get(origin.envelope.source_id)
-        return (evidence_eligible(anchor)
-                and all(anchor.permits(point) for point in coverage_bounds(origin.content))
+        if self._policy_epoch != self.store.proof_epoch:
+            self._policy_cache.clear()
+            self._origin_auth_cache.clear()
+            self._policy_epoch = self.store.proof_epoch
+        ref = self.store.reference(origin)
+        if self.store.get(ref) is None:
+            return False
+        if ref not in self._origin_auth_cache:
+            self._origin_auth_cache[ref] = bool(self.store.authenticated_roots(origin))
+        if not self._origin_auth_cache[ref]:
+            return False
+        key = (origin.envelope.source_id, origin.content.spec, origin.content.height_band_m)
+        if key not in self._policy_cache:
+            anchor = self.store.anchors.get(origin.envelope.source_id)
+            self._policy_cache[key] = (evidence_eligible(anchor)
+                and all(anchor.permits(point) for point in coverage_bounds(origin.content)))
+        return (self._policy_cache[key]
                 and self._now_us <= min(origin.envelope.valid_until_us,
                                         origin.envelope.capture_time_us + self.ttl_us))
 
@@ -363,9 +382,20 @@ class CoverageMap:
         return sorted({(c.evidence_ref, c.state) for c in self.records_at(cell, now_us)
                        if c.state == "occupied" or (c.state == "free" and self._free_usable(c))})
 
-    def _state(self, records):
+    def _state(self, records, free_policy=None):
+        if len(records) == 1:
+            claim = next(iter(records))
+            if claim.state != 'free':
+                return claim.state
+            allowed = self._free_usable(claim) if free_policy is None else free_policy[claim.evidence_ref]
+            return 'free' if allowed else 'unknown'
         occupied = [c for c in records if c.state == "occupied"]
-        free = [c for c in records if c.state == "free" and self._free_usable(c)]
+        free = [c for c in records if c.state == "free" and (
+            self._free_usable(c) if free_policy is None else free_policy[c.evidence_ref])]
+        if not occupied:
+            return "free" if free else "unknown"
+        if not free:
+            return "occupied"
         def compatible(o, f):
             lo, hi = vertical_bounds(o.message)
             band = f.message.content.height_band_m
@@ -384,8 +414,14 @@ class CoverageMap:
     def snapshot(self, now_us):
         self._prune(now_us)
         result = {"occupied": [], "free": [], "contested": []}
+        # A report has the same trust/expiry policy in every one of its cells.
+        # Resolve it once per snapshot, not thousands of times per grid.
+        free_policy = {}
         for cell, records in sorted(self._cells.items()):
-            state = self._state(records.values())
+            for claim in records.values():
+                if claim.state == 'free' and claim.evidence_ref not in free_policy:
+                    free_policy[claim.evidence_ref] = self._free_usable(claim)
+            state = self._state(records.values(), free_policy)
             if state != "unknown":
                 result[state].append(list(cell))
         result["unknown_count"] = self.spec.nx * self.spec.ny - sum(map(len, result.values()))

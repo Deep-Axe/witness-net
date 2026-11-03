@@ -50,18 +50,24 @@ class TrustAnchor:
 
     def __post_init__(self):
         Ed25519PublicKey.from_public_bytes(self.public_key)
-        if not self.key_ref or not isinstance(self.trust_class, TrustClass):
+        if type(self.key_ref) is not str or not self.key_ref.strip() or not isinstance(self.trust_class, TrustClass):
             raise ValueError("key reference and TrustClass required")
-        if self.physical_observer is not None and not self.physical_observer:
+        if self.physical_observer is not None and (type(self.physical_observer) is not str or not self.physical_observer.strip()):
             raise ValueError("physical_observer must be nonempty when set")
         if self.permitted_region is not None:
             r = self.permitted_region
             if len(r) != 6 or not all(math.isfinite(v) for v in r) or any(r[i] > r[i+3] for i in range(3)):
                 raise ValueError("invalid permitted region")
-        if any(not c for c in self.common_causes):
+        if (type(self.common_causes) not in (tuple, list)
+                or any(type(c) is not str or not c.strip() for c in self.common_causes)):
             raise ValueError("common cause identifiers must be nonempty")
         if type(self.anchored) is not bool:
             raise ValueError("anchored must be a boolean")
+        # Nested mutable inputs must not invalidate a store's cached trust.
+        object.__setattr__(self, 'public_key', bytes(self.public_key))
+        object.__setattr__(self, 'common_causes', tuple(self.common_causes))
+        if self.permitted_region is not None:
+            object.__setattr__(self, 'permitted_region', tuple(self.permitted_region))
 
     def permits(self, xyz: tuple[float, float, float]) -> bool:
         return len(xyz) == 3 and all(math.isfinite(v) for v in xyz) and (
