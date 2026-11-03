@@ -4,8 +4,11 @@
 (`src/coopx/radio_codec.py`), signed CX2 observation envelopes and authenticated
 lineage (`src/coopx/envelope.py`), Ed25519 identities and trust-anchor metadata
 (`src/coopx/identity.py`), claim-scoped witness counting, the deterministic
-admission checker with a bounded replay window (`src/coopx/checker.py`), and a
-binary packet transport with an end-to-end S1 run (`src/coopx/pipeline.py`).
+admission checker with a bounded replay window (`src/coopx/checker.py`), a
+binary packet transport with end-to-end S1 and S2 runs (`src/coopx/pipeline.py`),
+signed coverage messages as three row-major bitmaps (observed, free, occupied;
+magic `CX2C`) with a per-source coverage map (`src/coopx/coverage.py`), and
+deterministic assessment of admitted observations (`src/coopx/assess.py`).
 Other message-body codecs (coverage, query, answer, verdict, capability, label
 table), coverage/free-space checks and advisories remain specified, not built.
 

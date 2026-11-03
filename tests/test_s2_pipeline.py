@@ -1,7 +1,7 @@
 """S2 pipeline: coverage / assessment / map events, ghost admission, determinism.
 
-S2 event types are not yet in coopx.events on this branch (Agent A adds them).
-The validator below is the local full check the viewer also implements.
+The local validator mirrors the viewer's checks; every event must also pass
+`coopx.events.validate` (the single schema source).
 """
 
 from collections import Counter
@@ -10,23 +10,24 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from coopx.events import CHECK_CODES, FIELDS, SCHEMA
-from coopx.observers.lidar_synth import S2_GRID
+from coopx import events as event_schema
+from coopx.checker import Checker
+from coopx.envelope import decode, encode, evidence_ref
+from coopx.events import ASSESSMENT_CODES, CHECK_CODES, FIELDS, SCHEMA
+from coopx.observers.lidar_synth import S2_GRID, LidarObserver, default_s2_world
 from coopx.pipeline import (
-    ASSESSMENT_CODES,
-    COVERAGE_PREFIX,
-    S2_EVENT_TYPES,
     S2_GHOST_FREE_XYZ,
     S2_GHOST_SILENT_XYZ,
-    StubCoverageChecker,
-    decode_coverage_stub,
-    encode_coverage_stub,
+    S2_NODES,
+    S2_TTL_US,
+    _anchors_and_keys,
+    _signed_coverage,
     run_s2,
+    wire_coverage,
 )
-from coopx.observers.lidar_synth import CoverageContent, LidarObserver, default_s2_world
 from coopx.transport import EVENT_KEYS, EVENT_TYPES
 
-S2_TYPES = set(EVENT_TYPES) | set(S2_EVENT_TYPES)
+S2_TYPES = set(EVENT_TYPES)
 ASSESSMENT_STATES = {"corroborated", "contradicted", "unverified", "contested"}
 CHECK_STATES = {"accepted", "rejected"}
 
@@ -131,6 +132,7 @@ class S2PipelineTests(unittest.TestCase):
             events = load_events(path)
             for event in events:
                 validate_log_event(event)
+                event_schema.validate(event)
             counts = Counter(e["type"] for e in events)
             self.assertGreater(counts["coverage_published"], 0)
             self.assertGreater(counts["assessment"], 0)
@@ -189,20 +191,70 @@ class S2PipelineTests(unittest.TestCase):
             self._run(b, key_seed=3)
             self.assertEqual(load_events(a), load_events(b))
 
-    def test_stub_coverage_checker_admits_standin_only(self):
-        lidar = LidarObserver(S2_GRID, seed=0)
-        coverage = lidar.scan(default_s2_world(), t_us=0)
-        raw = encode_coverage_stub(
-            coverage, source_id="lidar1", message_id="c0",
-            capture_time_us=0, valid_until_us=1_000_000)
-        self.assertTrue(raw.startswith(COVERAGE_PREFIX))
-        checker = StubCoverageChecker()
-        self.assertEqual(checker.check(raw, 0).codes, ("OK",))
-        self.assertEqual(checker.check(b"not-cov", 0).codes, ("DECODE_ERROR",))
-        decoded = decode_coverage_stub(raw)
-        self.assertIsInstance(decoded.content, CoverageContent)
-        self.assertEqual(decoded.source_id, "lidar1")
+    def test_free_space_ghost_contradicted_silent_ghost_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s2.jsonl"
+            self._run(path)
+            events = load_events(path)
+            coverage_refs = {e["evidence_ref"] for e in events
+                             if e["type"] == "coverage_published" and e["source_id"] == "lidar1"}
+            by_source = {}
+            for e in events:
+                if e["type"] == "assessment":
+                    by_source.setdefault(e["source_id"], []).append(e)
+            ghost1 = by_source["ghost1"]
+            self.assertTrue(ghost1)
+            for e in ghost1:
+                self.assertEqual((e["state"], e["check_codes"]),
+                                 ("contradicted", ["CONTRADICTED_BY_FREE_SPACE"]))
+                self.assertTrue(e["detail"]["contradicting"])
+                self.assertLessEqual(set(e["detail"]["contradicting"]), coverage_refs)
+            # Silence is not free space: behind the truck no range sensor looks.
+            for e in by_source["ghost2"]:
+                self.assertEqual((e["state"], e["check_codes"]),
+                                 ("unverified", ["UNVERIFIED_SINGLE_SOURCE"]))
+                self.assertEqual(e["detail"]["contradicting"], [])
+            # Geometric LiDAR support corroborates position only, never class.
+            pole_codes = Counter(e["check_codes"][0] for e in by_source["pole1"])
+            self.assertGreater(pole_codes["POSITION_CORROBORATED_CLASS_UNVERIFIED"], 0)
+            self.assertEqual(pole_codes["CORROBORATED"], 0)
 
+    def test_contested_cell_links_lidar_free_and_ghost_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s2.jsonl"
+            self._run(path)
+            events = load_events(path)
+            published = {e["evidence_ref"]: e for e in events
+                         if e["type"] in ("coverage_published", "observation_published")}
+            ghost_cell = list(S2_GRID.cell_of(*S2_GHOST_FREE_XYZ[:2]))
+            snaps = [e for e in events if e["type"] == "map_snapshot"]
+            contested = [s for s in snaps if ghost_cell in s["detail"]["contested"]]
+            self.assertTrue(contested)
+            self.assertTrue(all(s["t_replay_us"] > 2_000_000 for s in contested))
+            for snap in contested:
+                entry = next(c for c in snap["detail"]["contested_claims"]
+                             if c["cell"] == ghost_cell)
+                kinds = {(published[ref]["source_id"], kind) for ref, kind in entry["claims"]}
+                self.assertIn(("lidar1", "free"), kinds)
+                self.assertIn(("ghost1", "occupied"), kinds)
+            silent_cell = list(S2_GRID.cell_of(*S2_GHOST_SILENT_XYZ[:2]))
+            self.assertFalse(any(silent_cell in s["detail"]["contested"] for s in snaps))
+
+    def test_coverage_is_signed_and_forgery_is_rejected(self):
+        keys, anchors = _anchors_and_keys(S2_NODES, key_seed=1)
+        checker = Checker(anchors, ttl_us=S2_TTL_US)
+        scan = LidarObserver(S2_GRID, seed=0).scan(default_s2_world(), t_us=100_000)
+        content = wire_coverage(scan, 100_000)
+        honest = _signed_coverage("lidar1", keys["lidar1"], content, sim_us=100_000,
+                                  sensor_seq=0, message_id="c0")
+        raw = encode(honest)
+        self.assertEqual(raw[:4], b"CX2C")
+        self.assertEqual(evidence_ref(decode(raw)), evidence_ref(honest))
+        self.assertEqual(checker.check(raw, 150_000).codes, ("OK",))
+        # A ghost cannot publish free space in the LiDAR's name.
+        forged = encode(_signed_coverage("lidar1", keys["ghost1"], content, sim_us=100_000,
+                                         sensor_seq=1, message_id="c1"))
+        self.assertEqual(checker.check(forged, 150_000).codes, ("BAD_SIGNATURE",))
 
 if __name__ == "__main__":
     unittest.main()

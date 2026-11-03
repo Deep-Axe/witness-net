@@ -224,7 +224,10 @@ function latestOf(type, t) {
 function latestAssessments(t) {
   const byRef = new Map();
   for (const event of until(t)) {
-    if (event.type === "assessment" && event.evidence_ref) byRef.set(event.evidence_ref, event);
+    // Latest judgement per source and footprint; older frames are superseded.
+    if (event.type === "assessment") {
+      byRef.set(`${event.source_id}|${JSON.stringify(event.detail.cells || [])}`, event);
+    }
   }
   return [...byRef.values()];
 }
@@ -322,26 +325,40 @@ function cellKey(cell) {
   return `${cell[0]},${cell[1]}`;
 }
 
+function eventByRef(ref, t) {
+  // Publication row for a claim's evidence ref (coverage or observation).
+  for (const event of until(t)) {
+    if ((event.type === "coverage_published" || event.type === "observation_published")
+        && event.evidence_ref === ref) return event;
+  }
+  return null;
+}
+
 function claimsForCell(ix, iy) {
-  const claims = [];
   const key = cellKey([ix, iy]);
+  const snap = latestOf("map_snapshot", state.t);
+  const contested = (snap && Array.isArray(snap.detail.contested_claims))
+    ? snap.detail.contested_claims.find((c) => isCell(c.cell) && cellKey(c.cell) === key)
+    : null;
+  if (contested && Array.isArray(contested.claims)) {
+    // The ego map's own per-source claims behind this contested cell.
+    const claims = [];
+    for (const pair of contested.claims) {
+      if (!Array.isArray(pair) || !isHex64(pair[0])) continue;
+      const event = eventByRef(pair[0], state.t);
+      if (event) claims.push({ kind: String(pair[1]), event });
+    }
+    return claims;
+  }
+  // Otherwise: the latest coverage from each source that covers this cell.
+  const latestCoverage = new Map();
   for (const event of until(state.t)) {
-    if (event.type === "coverage_published") {
-      const free = event.detail.free || [];
-      const occupied = event.detail.occupied || [];
-      if (free.some((c) => cellKey(c) === key)) {
-        claims.push({ kind: "free", event });
-      }
-      if (occupied.some((c) => cellKey(c) === key)) {
-        claims.push({ kind: "occupied", event });
-      }
-    }
-    if (event.type === "assessment") {
-      const cells = event.detail.cells || [];
-      if (cells.some((c) => cellKey(c) === key)) {
-        claims.push({ kind: event.state, event });
-      }
-    }
+    if (event.type === "coverage_published") latestCoverage.set(event.source_id, event);
+  }
+  const claims = [];
+  for (const event of latestCoverage.values()) {
+    if ((event.detail.free || []).some((c) => cellKey(c) === key)) claims.push({ kind: "free", event });
+    if ((event.detail.occupied || []).some((c) => cellKey(c) === key)) claims.push({ kind: "occupied", event });
   }
   return claims;
 }

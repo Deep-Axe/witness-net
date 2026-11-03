@@ -8,7 +8,7 @@ from coopx import events
 from coopx.checker import Checker
 from coopx.domain import ObjectClass
 from coopx.envelope import encode, evidence_ref, decode
-from coopx.pipeline import S1_TTL_US, _anchors_and_keys, _signed_observation, _handle_deliveries, run_s1
+from coopx.pipeline import S1_TTL_US, _anchors_and_keys, _check_event, _signed_observation, run_s1
 from coopx.transport import PacketTransport
 
 
@@ -54,8 +54,24 @@ class S1IntegrationTests(unittest.TestCase):
         keys, anchors = _anchors_and_keys()
         checker = Checker(anchors, ttl_us=S1_TTL_US)
         log = []
+        tally = {"accepted": 0, "rejected": 0}
+
+        def on_delivery(delivery):
+            # Same pairing as run_s1: the check follows its packet_delivered.
+            if delivery.receiver != "ego":
+                return
+            result = checker.check(delivery.packet, delivery.available_sim_us)
+            log.append(_check_event(delivery, result, delivery.available_sim_us))
+            tally[result.state] += 1
+
+        def handled(until_us):
+            before = dict(tally)
+            transport.receive_until(until_us)
+            return (tally["accepted"] - before["accepted"], tally["rejected"] - before["rejected"])
+
         transport = PacketTransport(("pole1", "car1", "ego"), delay_us=100_000,
-                                    jitter_us=80_000, seed=7, event_callback=log.append)
+                                    jitter_us=80_000, seed=7, event_callback=log.append,
+                                    delivery_callback=on_delivery)
         packets = []
         for frame in range(10):
             t = frame * 100_000
@@ -65,7 +81,7 @@ class S1IntegrationTests(unittest.TestCase):
                 velocity=(1.4, 0.0, 0.0)))
             packets.append(raw)
             transport.send("pole1", raw, sim_us=t, message_type="observation")
-        accepted, rejected = _handle_deliveries(transport.receive_until(1_100_000), checker, log)
+        accepted, rejected = handled(1_100_000)
         self.assertEqual((accepted, rejected), (10, 0))
         latest = checker.latest("pole1", 1)
         # Car signs a packet claiming to be the pole: signature fails.
@@ -79,7 +95,7 @@ class S1IntegrationTests(unittest.TestCase):
             transport.send("pole1", raw, sim_us=send_us, message_id=envelope.message_id,
                            message_type="observation")
             before = len(log)
-            accepted, rejected = _handle_deliveries(transport.receive_until(send_us + 200_000), checker, log)
+            accepted, rejected = handled(send_us + 200_000)
             self.assertEqual((accepted, rejected), (0, 1))
             checks = [event for event in log[before:] if event["type"] == "check"]
             self.assertEqual(len(checks), 1)

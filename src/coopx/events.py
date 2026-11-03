@@ -124,6 +124,25 @@ def _s2_detail(d):
                 or type(detail["unknown_count"]) is not int
                 or detail["unknown_count"] != grid.nx * grid.ny - len(occupied | free | contested)):
             raise ValueError("map states must partition the grid")
+        if "contested_claims" in detail:
+            entries = detail["contested_claims"]
+            if type(entries) is not list or len(entries) != len(contested):
+                raise ValueError("contested_claims must list every contested cell once")
+            seen = set()
+            for entry in entries:
+                if (type(entry) is not dict or set(entry) != {"cell", "claims"}
+                        or type(entry["cell"]) is not list or tuple(entry["cell"]) not in contested
+                        or tuple(entry["cell"]) in seen or type(entry["claims"]) is not list):
+                    raise ValueError("contested_claims entry must name a contested cell")
+                seen.add(tuple(entry["cell"]))
+                kinds = set()
+                for claim in entry["claims"]:
+                    if (type(claim) is not list or len(claim) != 2 or not _reference(claim[0])
+                            or claim[1] not in ("free", "occupied")):
+                        raise ValueError("claim must be [evidence_ref, free|occupied]")
+                    kinds.add(claim[1])
+                if kinds != {"free", "occupied"}:
+                    raise ValueError("a contested cell needs both a free and an occupied claim")
 
 
 def validate(d: dict) -> None:

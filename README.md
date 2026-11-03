@@ -59,10 +59,10 @@ Details: [protocol draft](docs/protocol.md) ·
 | CX2 signed observations, Ed25519 identities, authenticated lineage and witness accounting | Implemented; round-trip, tampering, relay and dependency tests pass |
 | Meta API access (Spark JSON + function calls, SAM image/video, Voice) | Verified with small probes; not yet integrated |
 | Deterministic checker (signature, freshness, future time, duplicates, bounded replay window, bounds) | Implemented; honest reordered traffic accepted, replay/forgery rejected |
-| S1 slice: signed observations → packet transport (delay, jitter, loss, disconnect) → checker → JSONL event log → browser viewer | Implemented; backend tested end to end, viewer skeleton only |
-| Coverage, free space, contested regions | Next (S2) |
+| S1 slice: signed observations → packet transport (delay, jitter, loss, disconnect) → checker → JSONL event log → browser viewer | Implemented; tested end to end; viewer renders log text safely |
+| S2 slice: signed LiDAR coverage (`CX2C` bitmaps), per-source coverage map with contested cells, deterministic assessment (contradicted by free space, position-only support, unverified) | Implemented on a synthetic 2-D world, no LLM; a ghost in LiDAR free space is contradicted, a ghost where no range sensor looks stays unverified |
 | V2X-Real reader and projection calibration | Implemented; three frames, six cameras, and RSU → vehicle projections inspected; capture synchronization unproven |
-| Tests | 81 passing |
+| Tests | 147 passing |
 | Dataset replay ([V2X-Real](https://mobility-lab.seas.ucla.edu/v2x-real/) validation split) | Data extracted; replay integration pending |
 | Muse Reasoner, SAM observer, attacks, evaluation, full demo UI | Not started |
 
@@ -88,6 +88,15 @@ consumer) and its viewer:
 .venv/bin/python -m coopx s1 --output data/s1-events.jsonl --loss 0.1 --jitter-us 150000 --disconnect-at-us 3000000
 .venv/bin/python scripts/serve_ui.py      # localhost only; serves ui/ and data/*.jsonl, never .env
 # open http://127.0.0.1:8765/ui/index.html?log=/data/s1-events.jsonl
+```
+
+Slice S2 (LiDAR free space against camera ghosts, no LLM). Click the
+contested cell on the map to see the LiDAR free claim and the ghost's
+occupied claim:
+
+```sh
+.venv/bin/python -m coopx s2 --output data/s2-events.jsonl --key-seed 1
+# open http://127.0.0.1:8765/ui/index.html?log=/data/s2-events.jsonl
 ```
 
 No API key or credits are needed for these checks. The synthetic command

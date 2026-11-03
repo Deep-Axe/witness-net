@@ -92,10 +92,8 @@ def make_event(*, t_replay_us: int, type: str, source_id: str,
                dest_id: str | None = None, message_id: str | None = None,
                message_type: str | None = None, evidence_ref: str | None = None,
                bytes: int | None = None, check_codes: list[str] | None = None,
-               state: str | None = None, detail: dict | None = None,
-               extra_types: frozenset[str] | tuple[str, ...] = ()) -> dict:
-    allowed = EVENT_TYPES if not extra_types else (set(EVENT_TYPES) | set(extra_types))
-    if type not in allowed:
+               state: str | None = None, detail: dict | None = None) -> dict:
+    if type not in EVENT_TYPES:
         raise ValueError(f"unknown event type {type}")
     return {
         "schema": EVENT_SCHEMA,

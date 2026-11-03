@@ -1,11 +1,12 @@
-"""S1/S2 runs: signed observations (and S2 coverage stand-ins) through PacketTransport.
+"""S1/S2 runs: signed observations and signed coverage through PacketTransport.
 
 Default checker is the deterministic `coopx.checker.Checker` built from the
 run's trust anchors. `PassThroughChecker` remains available for transport-only
 debugging (`checker=PassThroughChecker()`).
 
-S2 coverage/assessment types are local stubs that match contracts 2–3. The
-reviewer replaces the three SWAP_SEAM assignments with Agent A's modules.
+S2 admits every packet (observation or CX2C coverage) with the real Checker,
+feeds admitted coverage into `coopx.coverage.CoverageMap`, and judges admitted
+observations with `coopx.assess.Assessor`. No LLM.
 """
 
 from collections import Counter
@@ -17,18 +18,15 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from coopx.assess import Assessment, Assessor
 from coopx.checker import Checker, CheckResult
+from coopx.coverage import CoverageContent, CoverageMap, CoverageMessage, GridSpec
 from coopx.domain import ObjectClass, Observation, PositionAnchor
-from coopx.envelope import Auth, Envelope, Lineage, ObservationMessage, decode, encode, sign
+from coopx.envelope import (Auth, Envelope, EvidenceStore, Lineage, ObservationMessage,
+                            decode, encode, sign)
 from coopx.identity import NodeKey, TrustAnchor, TrustClass
-from coopx.observers.lidar_synth import (
-    CoverageContent,
-    GridSpec,
-    LidarObserver,
-    S2_GRID,
-    SynthWorld,
-    default_s2_world,
-)
+from coopx.observers import lidar_synth
+from coopx.observers.lidar_synth import LidarObserver, default_s2_world
 from coopx.transport import PacketDelivery, PacketTransport, make_event, packet_hash
 
 S1_NODES = ("pole1", "car1", "ego")
@@ -50,16 +48,10 @@ S2_POLE_POSE = (0.0, -4.0)
 S2_GHOST_FREE_XYZ = (5.5, -8.5, 0.5)
 S2_GHOST_SILENT_XYZ = (24.0, 15.2, 0.5)  # behind the parked truck along a lidar ray
 
-# Local until Agent A adds these to coopx.events. Keep extra types out of transport.
-S2_EVENT_TYPES = frozenset({"coverage_published", "assessment", "map_snapshot"})
-ASSESSMENT_CODES = (
-    "CORROBORATED",
-    "CONTRADICTED_BY_FREE_SPACE",
-    "POSITION_CORROBORATED_CLASS_UNVERIFIED",
-    "UNVERIFIED_SINGLE_SOURCE",
-    "CONTESTED",
-)
-COVERAGE_PREFIX = b"COV1"
+# Wire grid (coopx.coverage.GridSpec) mirroring the observer's geometry grid.
+S2_GRID = GridSpec(float(lidar_synth.S2_GRID.origin_x), float(lidar_synth.S2_GRID.origin_y),
+                   float(lidar_synth.S2_GRID.cell_m), lidar_synth.S2_GRID.nx,
+                   lidar_synth.S2_GRID.ny)
 
 
 class PassThroughChecker:
@@ -133,20 +125,18 @@ def _pose(source: str, frame: int) -> tuple[ObjectClass, tuple[float, float, flo
     return ObjectClass.VEHICLE, (12.0 + 6.0 * t_s, 4.0, 0.8), (6.0, 0.0, 0.0)
 
 
-def _s2_event(**kwargs) -> dict:
-    return make_event(extra_types=S2_EVENT_TYPES, **kwargs)
-
-
 def _check_event(delivery: PacketDelivery, result: CheckResult, now_us: int) -> dict:
     message = result.message
     envelope = None if message is None else message.envelope
     detail = {}
-    if message is not None:
+    if isinstance(message, ObservationMessage):
         detail = {
             "xyz": list(message.observation.xyz_m),
             "cls": message.observation.cls.name,
             "sensor_seq": envelope.sensor_seq,
         }
+    elif message is not None:
+        detail = {"sensor_seq": envelope.sensor_seq}
     if delivery.tx_id is not None:
         detail["tx_id"] = delivery.tx_id
     return make_event(
@@ -194,162 +184,38 @@ def _write_events(path: Path, events: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# S2 stubs (SWAP_SEAM — reviewer replaces these with Agent A's types)
+# S2 helpers: signed coverage, events
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True, slots=True)
-class Assessment:
-    state: str
-    codes: tuple[str, ...]
-    cells: tuple[tuple[int, int], ...]
-    supporting: tuple[str, ...]
-    contradicting: tuple[str, ...]
-    reason: str
+def wire_coverage(content: lidar_synth.CoverageContent, capture_us: int) -> CoverageContent:
+    """Observer output (contract 2) -> coopx.coverage.CoverageContent.
+
+    The capture window ends at the envelope capture time (coverage invariant).
+    """
+    spec = content.spec
+    grid = GridSpec(float(spec.origin_x), float(spec.origin_y), float(spec.cell_m),
+                    spec.nx, spec.ny)
+    return CoverageContent(
+        grid, (max(0, capture_us - S2_DT_US), capture_us), content.modality,
+        tuple(float(v) for v in content.height_band_m), float(content.min_size_m),
+        frozenset(content.observed), frozenset(content.free), frozenset(content.occupied))
 
 
-@dataclass(frozen=True, slots=True)
-class StubCoverageMessage:
-    """JSON-bytes stand-in for a signed coverage packet / message."""
-
-    source_id: str
-    evidence_ref: str
-    content: CoverageContent
-    capture_time_us: int
-    valid_until_us: int
-    message_id: str
+def _signed_coverage(source: str, key: NodeKey, content: CoverageContent, *, sim_us: int,
+                     sensor_seq: int, message_id: str) -> CoverageMessage:
+    envelope = Envelope(
+        2, "coverage", message_id, source, S2_SESSION, S2_FRAME,
+        sim_us, sim_us, sim_us + S2_TTL_US, Auth(f"{source}-key"), sensor_seq)
+    lineage = Lineage(source, "synthetic_lidar", message_id, sim_us, derivation="direct")
+    return sign(CoverageMessage(envelope, content, lineage), key)
 
 
-class StubCoverageChecker:
-    """Admit stand-in coverage packets. Observations stay on the real Checker."""
-
-    def check(self, raw: bytes, now_us: int) -> CheckResult:
-        if not isinstance(raw, (bytes, bytearray)) or not raw.startswith(COVERAGE_PREFIX):
-            return CheckResult(("DECODE_ERROR",), "rejected", None)
-        try:
-            decode_coverage_stub(bytes(raw))
-        except (ValueError, TypeError, json.JSONDecodeError):
-            return CheckResult(("DECODE_ERROR",), "rejected", None)
-        return CheckResult(("OK",), "accepted", None)
-
-
-class StubCoverageMap:
-    def __init__(self, spec: GridSpec = S2_GRID):
-        self.spec = spec
-        self._items: list[tuple[StubCoverageMessage, int]] = []
-
-    def add(self, coverage_message: StubCoverageMessage, now_us: int) -> None:
-        self._items.append((coverage_message, now_us))
-
-    def snapshot(self, now_us: int) -> dict:
-        occupied: set[tuple[int, int]] = set()
-        free: set[tuple[int, int]] = set()
-        for message, _added in self._items:
-            if now_us > message.valid_until_us:
-                continue
-            occupied |= set(message.content.occupied)
-            free |= set(message.content.free)
-        contested = occupied & free
-        occupied -= contested
-        free -= contested
-        known = occupied | free | contested
-        return {
-            "occupied": [list(c) for c in sorted(occupied)],
-            "free": [list(c) for c in sorted(free)],
-            "contested": [list(c) for c in sorted(contested)],
-            "unknown_count": self.spec.nx * self.spec.ny - len(known),
-        }
-
-    def claims_at(self, cell: tuple[int, int], now_us: int) -> list[tuple[str, str]]:
-        out = []
-        for message, _added in self._items:
-            if now_us > message.valid_until_us:
-                continue
-            if cell in message.content.free:
-                out.append((message.evidence_ref, "free"))
-            if cell in message.content.occupied:
-                out.append((message.evidence_ref, "occupied"))
-        return out
-
-
-class PassThroughAssessor:
-    """Always unverified. Swap for Agent A's Assessor at merge."""
-
-    def __init__(self, store, coverage_map, *, agrees=None):
-        self.store = store
-        self.coverage_map = coverage_map
-
-    def assess(self, message: ObservationMessage, now_us: int) -> Assessment:
-        cells = _footprint_cells(message.observation.xyz_m, S2_GRID)
-        ref = getattr(message, "evidence_ref", "")
-        return Assessment(
-            "unverified", ("UNVERIFIED_SINGLE_SOURCE",), cells,
-            (ref,) if ref else (), (), "single source (stub)")
-
-
-def encode_coverage_stub(content: CoverageContent, *, source_id: str, message_id: str,
-                         capture_time_us: int, valid_until_us: int) -> bytes:
-    body = {
-        "source_id": source_id,
-        "message_id": message_id,
-        "capture_time_us": capture_time_us,
-        "valid_until_us": valid_until_us,
-        "spec": {
-            "origin": [content.spec.origin_x, content.spec.origin_y],
-            "cell_m": content.spec.cell_m,
-            "nx": content.spec.nx,
-            "ny": content.spec.ny,
-        },
-        "window_us": list(content.window_us),
-        "modality": content.modality,
-        "height_band_m": list(content.height_band_m),
-        "min_size_m": content.min_size_m,
-        "observed": [list(c) for c in sorted(content.observed)],
-        "free": [list(c) for c in sorted(content.free)],
-        "occupied": [list(c) for c in sorted(content.occupied)],
-    }
-    return COVERAGE_PREFIX + json.dumps(body, allow_nan=False, separators=(",", ":")).encode("utf-8")
-
-
-def decode_coverage_stub(raw: bytes) -> StubCoverageMessage:
-    if not raw.startswith(COVERAGE_PREFIX):
-        raise ValueError("not a coverage stand-in")
-    body = json.loads(raw[len(COVERAGE_PREFIX):].decode("utf-8"))
-    spec_d = body["spec"]
-    spec = GridSpec(spec_d["origin"][0], spec_d["origin"][1], spec_d["cell_m"],
-                    spec_d["nx"], spec_d["ny"])
-    content = CoverageContent(
-        spec,
-        (int(body["window_us"][0]), int(body["window_us"][1])),
-        body["modality"],
-        (float(body["height_band_m"][0]), float(body["height_band_m"][1])),
-        float(body["min_size_m"]),
-        frozenset(tuple(c) for c in body["observed"]),
-        frozenset(tuple(c) for c in body["free"]),
-        frozenset(tuple(c) for c in body["occupied"]),
-    )
-    return StubCoverageMessage(
-        body["source_id"], packet_hash(raw), content,
-        int(body["capture_time_us"]), int(body["valid_until_us"]), body["message_id"])
-
-
-def _footprint_cells(xyz: tuple[float, float, float], spec: GridSpec,
-                     half_m: float = 0.5) -> tuple[tuple[int, int], ...]:
-    cells = set()
-    for dx in (-half_m, 0.0, half_m):
-        for dy in (-half_m, 0.0, half_m):
-            ix = floor((xyz[0] + dx - spec.origin_x) / spec.cell_m)
-            iy = floor((xyz[1] + dy - spec.origin_y) / spec.cell_m)
-            if spec.in_bounds(ix, iy):
-                cells.add((ix, iy))
-    return tuple(sorted(cells))
-
-
-def _coverage_published_event(message: StubCoverageMessage, raw: bytes, sim_us: int) -> dict:
+def _coverage_published_event(message: CoverageMessage, raw: bytes, sim_us: int) -> dict:
     content = message.content
-    return _s2_event(
-        t_replay_us=sim_us, type="coverage_published", source_id=message.source_id,
-        message_id=message.message_id, message_type="coverage",
-        evidence_ref=message.evidence_ref, bytes=len(raw),
+    return make_event(
+        t_replay_us=sim_us, type="coverage_published", source_id=message.envelope.source_id,
+        message_id=message.envelope.message_id, message_type="coverage",
+        evidence_ref=packet_hash(raw), bytes=len(raw),
         detail={
             "grid": {
                 "origin": [content.spec.origin_x, content.spec.origin_y],
@@ -367,7 +233,7 @@ def _coverage_published_event(message: StubCoverageMessage, raw: bytes, sim_us: 
 
 def _assessment_event(message: ObservationMessage, assessment: Assessment,
                       evidence_ref: str, now_us: int, nbytes: int) -> dict:
-    return _s2_event(
+    return make_event(
         t_replay_us=now_us, type="assessment",
         source_id=message.envelope.source_id, dest_id="ego",
         message_id=message.envelope.message_id, message_type="observation",
@@ -381,10 +247,14 @@ def _assessment_event(message: ObservationMessage, assessment: Assessment,
         })
 
 
-def _map_snapshot_event(snapshot: dict, now_us: int) -> dict:
-    return _s2_event(
-        t_replay_us=now_us, type="map_snapshot", source_id="ego",
-        detail=dict(snapshot))
+def _map_snapshot_event(coverage_map: CoverageMap, now_us: int) -> dict:
+    """Ego map at a tick, plus the per-source claims behind every contested cell."""
+    detail = dict(coverage_map.snapshot(now_us))
+    detail["contested_claims"] = [
+        {"cell": cell, "claims": [[ref, kind] for ref, kind in
+                                  coverage_map.claims_at(tuple(cell), now_us)]}
+        for cell in detail["contested"]]
+    return make_event(t_replay_us=now_us, type="map_snapshot", source_id="ego", detail=detail)
 
 
 # ---------------------------------------------------------------------------
@@ -457,14 +327,11 @@ def run_s1(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
 
 def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 100_000,
-           jitter_us: int = 0, key_seed: int = 0,
-           checker=None, coverage_checker=None, coverage_map=None, assessor=None) -> dict:
-    """Pole camera + LiDAR observer + two camera ghosts. No LLM.
+           jitter_us: int = 0, key_seed: int = 0, checker=None) -> dict:
+    """Pole camera + LiDAR observer + two camera ghosts, judged with no LLM.
 
-    SWAP_SEAM (one line each, reviewer):
-      coverage_checker = StubCoverageChecker()
-      coverage_map = StubCoverageMap()
-      assessor = PassThroughAssessor(store=None, coverage_map=coverage_map)
+    Every packet goes through the real Checker. Admitted coverage feeds the
+    CoverageMap; admitted observations are judged by the Assessor.
     """
     trust = {
         "pole1": TrustClass.A, "lidar1": TrustClass.A, "ego": TrustClass.A,
@@ -478,48 +345,41 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
         S2_NODES, key_seed=key_seed, trust=trust, anchored=anchored)
     if checker is None:
         checker = Checker(anchors, ttl_us=S2_TTL_US)
-    # SWAP_SEAM: coverage_checker
-    if coverage_checker is None:
-        coverage_checker = StubCoverageChecker()
-    # SWAP_SEAM: coverage_map
-    if coverage_map is None:
-        coverage_map = StubCoverageMap(S2_GRID)
-    # SWAP_SEAM: assessor
-    if assessor is None:
-        assessor = PassThroughAssessor(store=None, coverage_map=coverage_map)
+    store = EvidenceStore(anchors)
+    coverage_map = CoverageMap(S2_GRID, ttl_us=S2_TTL_US, spatial_frame_id=S2_FRAME, store=store)
+    assessor = Assessor(store, coverage_map)
 
     world = default_s2_world()
-    lidar = LidarObserver(S2_GRID, pose=S2_LIDAR_POSE, seed=seed)
+    lidar = LidarObserver(lidar_synth.S2_GRID, pose=S2_LIDAR_POSE, seed=seed)
     events: list[dict] = []
     accepted = rejected = 0
-    assessments = 0
+    outcomes: Counter = Counter()
+    sequences: Counter = Counter()
 
-    def admit(raw: bytes, now_us: int) -> CheckResult:
-        if raw.startswith(COVERAGE_PREFIX):
-            return coverage_checker.check(raw, now_us)
-        return checker.check(raw, now_us)
+    def next_seq(source: str) -> int:
+        # One increasing stream per source across coverage and object packets.
+        value = sequences[source]
+        sequences[source] += 1
+        return value
 
     def on_delivery(delivery: PacketDelivery) -> None:
-        nonlocal accepted, rejected, assessments
+        nonlocal accepted, rejected
         if delivery.receiver != "ego":
             return
-        result = admit(delivery.packet, delivery.available_sim_us)
-        events.append(_check_event(delivery, result, delivery.available_sim_us))
+        now_us = delivery.available_sim_us
+        result = checker.check(delivery.packet, now_us)
+        events.append(_check_event(delivery, result, now_us))
         if result.state != "accepted":
             rejected += 1
             return
         accepted += 1
-        if delivery.message_type == "coverage" or delivery.packet.startswith(COVERAGE_PREFIX):
-            coverage_message = decode_coverage_stub(delivery.packet)
-            coverage_map.add(coverage_message, delivery.available_sim_us)
+        if isinstance(result.message, CoverageMessage):
+            coverage_map.add(result.message, now_us)
             return
-        if result.message is None:
-            return
-        assessment = assessor.assess(result.message, delivery.available_sim_us)
+        assessment = assessor.assess(result.message, now_us)
         events.append(_assessment_event(
-            result.message, assessment, delivery.evidence_ref,
-            delivery.available_sim_us, len(delivery.packet)))
-        assessments += 1
+            result.message, assessment, delivery.evidence_ref, now_us, len(delivery.packet)))
+        outcomes[(result.message.envelope.source_id, assessment.codes[0])] += 1
 
     transport = PacketTransport(
         S2_NODES, delay_us=delay_us, jitter_us=jitter_us, loss_probability=loss,
@@ -527,46 +387,44 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
     def publish_observation(source: str, object_id: int, frame: int, sim_us: int,
                             cls: ObjectClass, xyz, velocity, dimensions=None,
-                            message_id: str | None = None, sensor_seq: int | None = None) -> None:
+                            message_id: str | None = None) -> None:
+        sensor_seq = next_seq(source)
         message = _signed_observation(
             source, keys[source], object_id=object_id, frame=frame,
             sim_us=sim_us, cls=cls, xyz=xyz, velocity=velocity,
             session=S2_SESSION, dimensions=dimensions,
             message_id=message_id, sensor_seq=sensor_seq)
         raw = encode(message)
-        events.append(_s2_event(
+        events.append(make_event(
             t_replay_us=sim_us, type="observation_published", source_id=source,
             message_id=message.envelope.message_id, message_type="observation",
             evidence_ref=packet_hash(raw), bytes=len(raw),
-            detail={"xyz": list(xyz), "cls": cls.name, "sensor_seq": frame}))
+            detail={"xyz": list(xyz), "cls": cls.name, "sensor_seq": sensor_seq}))
         transport.send(source, raw, sim_us=sim_us,
                        message_id=message.envelope.message_id, message_type="observation")
 
-    last_snapshot_us = 0
     for frame, sim_us in enumerate(range(0, S2_DURATION_US, S2_DT_US)):
         transport.receive_until(sim_us)
-        events.append(_map_snapshot_event(coverage_map.snapshot(sim_us), sim_us))
-        last_snapshot_us = sim_us
+        events.append(_map_snapshot_event(coverage_map, sim_us))
 
         cls, xyz, velocity = _pose("pole1", frame)
         publish_observation("pole1", 1, frame, sim_us, cls, xyz, velocity)
 
-        coverage = lidar.scan(world, t_us=sim_us, window_us=(sim_us, sim_us + S2_DT_US))
+        scan = lidar.scan(world, t_us=sim_us)
         cov_id = f"lidar1-cov-{frame:04d}"
-        raw_cov = encode_coverage_stub(
-            coverage, source_id="lidar1", message_id=cov_id,
-            capture_time_us=sim_us, valid_until_us=sim_us + S2_TTL_US)
-        cov_msg = decode_coverage_stub(raw_cov)
-        events.append(_coverage_published_event(cov_msg, raw_cov, sim_us))
+        coverage = _signed_coverage(
+            "lidar1", keys["lidar1"], wire_coverage(scan, sim_us), sim_us=sim_us,
+            sensor_seq=next_seq("lidar1"), message_id=cov_id)
+        raw_cov = encode(coverage)
+        events.append(_coverage_published_event(coverage, raw_cov, sim_us))
         transport.send("lidar1", raw_cov, sim_us=sim_us,
                        message_id=cov_id, message_type="coverage")
 
-        for index, geom in enumerate(lidar.objects(coverage)):
+        for index, geom in enumerate(lidar.objects(scan)):
             publish_observation(
                 "lidar1", 100 + index, frame, sim_us, ObjectClass.UNKNOWN,
                 geom["xyz"], (0.0, 0.0, 0.0), geom["dimensions_m"],
-                message_id=f"lidar1-{frame:04d}-{index}",
-                sensor_seq=frame * 16 + index)
+                message_id=f"lidar1-{frame:04d}-{index}")
 
         if sim_us >= S2_GHOST_START_US:
             publish_observation(
@@ -578,7 +436,7 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
     drain_us = (S2_DURATION_US - S2_DT_US) + delay_us + jitter_us
     transport.receive_until(drain_us)
-    events.append(_map_snapshot_event(coverage_map.snapshot(drain_us), drain_us))
+    events.append(_map_snapshot_event(coverage_map, drain_us))
     events[:] = _write_events(output, events)
 
     by_type = Counter(event["type"] for event in events)
@@ -590,7 +448,8 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
         "drops": dict(transport.drops),
         "accepted": accepted,
         "rejected": rejected,
-        "assessments": assessments,
+        "assessments": sum(outcomes.values()),
+        "assessment_outcomes": {f"{src}:{code}": n for (src, code), n in sorted(outcomes.items())},
         "checker": type(checker).__name__,
         "n_events": len(events),
         "grid": {
@@ -598,4 +457,3 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
             "cell_m": S2_GRID.cell_m, "nx": S2_GRID.nx, "ny": S2_GRID.ny,
         },
     }
-
