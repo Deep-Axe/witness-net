@@ -119,7 +119,10 @@ def main() -> None:
                           choices=("ego", "union", "geo", "witness", "all"))
     evaluate.add_argument("--attack", default=None)
     evaluate.add_argument("--seed", type=int, default=0)
-    evaluate.add_argument("--offline", action="store_true")
+    evaluate.add_argument("--offline", action="store_true",
+                          help="SAM cache only; a miss is reported, not billed")
+    evaluate.add_argument("--perception", default="sam", choices=("sam", "gt-oracle"),
+                          help="sam is the headline; gt-oracle is the labelled comparison")
     evaluate.add_argument("--budget-usd", type=float, default=2.0)
     evaluate.add_argument("--output-dir", type=Path, default=Path("data/results"))
     evaluate.add_argument("--summary", type=Path, default=Path("results/summary.md"))
@@ -152,7 +155,7 @@ def main() -> None:
             from coopx.eval.runner import run_eval
             result = run_eval(scene=args.scene, fusion=args.fusion, attack=args.attack,
                               seed=args.seed, offline=args.offline, budget_usd=args.budget_usd,
-                              out_dir=args.output_dir)
+                              out_dir=args.output_dir, perception=args.perception)
             write_summary(args.output_dir, args.summary)
             result["summary"] = str(args.summary)
         elif args.command == "ledger":

@@ -66,7 +66,8 @@ class CameraObserver:
                  camera_name: str, client: MetaClient, lift_fn: Callable, key: NodeKey,
                  *, session: str = "s3", spatial_frame: str = "site_map",
                  ttl_us: int = 1_000_000, concepts: tuple[str, ...] = ("person",),
-                 answer_fn=answer_query, period_us: int = 0):
+                 answer_fn=answer_query, period_us: int = 0,
+                 seq_origin: int = 0):
         self.observer_id = observer_id
         self.frame_source = frame_source
         self.camera_name = camera_name
@@ -80,7 +81,9 @@ class CameraObserver:
         self.answer_fn = answer_fn
         self.period_us = int(period_us)
         self._last_observe_us: int | None = None
-        self._seq = 0
+        # Separate cameras of one vehicle share a source id, so sequences must not collide.
+        self._seq = int(seq_origin)
+        self._object_seq = 199 + int(seq_origin)
         self._latest: CameraFrame | None = None
         # What THIS observer signed and sent. Not "admitted": only the
         # receiving consumer's checker decides that.

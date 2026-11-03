@@ -141,5 +141,25 @@ def bytes_per_detection(nbytes: int, useful: int) -> float | None:
     return nbytes / useful
 
 
-def independence(message_count: int, root_count: int) -> dict:
-    return {"messages": message_count, "independent_roots": root_count}
+def independence(message_count: int, witness_count: int) -> dict:
+    """Message count versus EvidenceStore.independent_witnesses.
+
+    Unanchored identities add messages and zero witnesses. Relays of one
+    anchored observation count once.
+    """
+    return {"messages": message_count, "independent_witnesses": witness_count}
+
+
+def independent_witness_count(anchors, messages) -> int:
+    """Max independent witnesses of any observation in `messages`."""
+    from coopx.envelope import EvidenceStore, ObservationMessage, evidence_ref
+    store = EvidenceStore(anchors)
+    kept = []
+    for message in messages:
+        if not isinstance(message, ObservationMessage):
+            continue
+        ref = store.add(message)
+        kept.append(store.get(ref))
+    if not kept:
+        return 0
+    return max(store.independent_witnesses(message, kept) for message in kept)

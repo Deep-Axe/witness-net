@@ -3,7 +3,9 @@ import unittest
 
 from coopx.attacks import ATTACK_KINDS, apply_attack, attack_anchors, plan_attack
 from coopx.checker import Checker
+from coopx.coverage import CoverageMessage
 from coopx.envelope import decode, verify
+from coopx.eval.metrics import independent_witness_count
 from coopx.transport import PacketTransport
 
 SCENE = {"target_xyz": (21.0, -180.0, 0.5), "ego_xyz": (14.0, -171.0, 0.5),
@@ -13,6 +15,23 @@ NOW = 10_000_000
 
 
 class AttackTests(unittest.TestCase):
+    def test_absence_attacks_are_free_coverage(self):
+        for kind in ("majority_veto", "remote_clear"):
+            plan = plan_attack(kind, seed=2, scene=SCENE, now_us=NOW)
+            self.assertGreaterEqual(len(plan.packets), 1)
+            for packet in plan.packets:
+                message = decode(packet.raw)
+                self.assertIsInstance(message, CoverageMessage)
+                self.assertEqual(message.content.modality, "lidar")
+                self.assertTrue(message.content.free)
+                self.assertFalse(message.content.occupied)
+
+    def test_sybil_witnesses_are_zero_and_relays_count_once(self):
+        for kind, expected in (("sybil", 0), ("relay_dup", 1)):
+            plan = plan_attack(kind, seed=4, scene=SCENE, now_us=NOW)
+            _keys, anchors = attack_anchors(plan, region=REGION)
+            messages = [decode(packet.raw) for packet in plan.packets]
+            self.assertEqual(independent_witness_count(anchors, messages), expected, kind)
     def test_every_kind_is_deterministic_and_signed(self):
         for kind in ATTACK_KINDS:
             with self.subTest(kind=kind):

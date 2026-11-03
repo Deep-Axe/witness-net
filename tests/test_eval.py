@@ -40,12 +40,12 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(false_distrust(beliefs, targets), 1)
         self.assertEqual(unknown_region_rate(25, 100), 0.25)
         self.assertEqual(bytes_per_detection(400, 2), 200)
-        self.assertEqual(independence(6, 1), {"messages": 6, "independent_roots": 1})
+        self.assertEqual(independence(6, 1), {"messages": 6, "independent_witnesses": 1})
 
     def test_offline_fixture_witness_does_not_drop_the_ego(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = run_eval(scene="frame-000096", fusion="witness", attack="remote_clear",
-                              seed=1, offline=True, out_dir=Path(tmp))
+                              seed=1, offline=True, out_dir=Path(tmp), perception="gt-oracle")
             run = result["runs"][0]
             self.assertFalse(result["partial"])
             self.assertTrue(run["fusion_stub"])
@@ -54,6 +54,45 @@ class MetricTests(unittest.TestCase):
             text = render_summary([run])
             self.assertIn("frame-000096", text)
             self.assertIn("n/a", text)
+            self.assertEqual(run["metrics"]["safety_flips"], 0)
+            self.assertTrue(run["metrics"]["attack_caught"])
+
+    def test_union_trusts_a_remote_clear_and_witness_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            witness = run_eval(scene="frame-000096", fusion="witness", attack="remote_clear",
+                               seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
+            union = run_eval(scene="frame-000096", fusion="union", attack="remote_clear",
+                             seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
+            self.assertEqual(witness["metrics"]["safety_flips"], 0)
+            self.assertTrue(witness["metrics"]["attack_caught"])
+            self.assertGreaterEqual(union["metrics"]["safety_flips"], 1)
+            self.assertFalse(union["metrics"]["attack_caught"])
+
+    def test_sybil_adds_no_witness_and_a_relay_counts_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            sybil = run_eval(scene="frame-000096", fusion="witness", attack="sybil",
+                             seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
+            relay = run_eval(scene="frame-000096", fusion="witness", attack="relay_dup",
+                             seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
+            self.assertEqual(sybil["metrics"]["independence"]["independent_witnesses"], 0)
+            self.assertEqual(relay["metrics"]["independence"]["independent_witnesses"], 1)
+
+    def test_sam_failure_keeps_the_error_text(self):
+        from coopx.meta.client import MetaAPIError
+
+        class Boom:
+            def respond(self, **kwargs):
+                raise MetaAPIError(
+                    "Meta API network error: [Errno -2] Name or service not known",
+                    status=None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run = run_eval(scene="frame-000096", fusion="ego", seed=1, offline=True,
+                           out_dir=Path(tmp), perception="sam", client=Boom())["runs"][0]
+            self.assertIn("Name or service not known", run["error"])
+            self.assertTrue(run["partial"])
 
 
 if __name__ == "__main__":

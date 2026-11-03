@@ -822,18 +822,23 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         S3_NODES, delay_us=delay_us, jitter_us=0, loss_probability=0.0,
         seed=0, event_callback=events.append, delivery_callback=on_delivery)
 
-    def make_observer(observer_id, agent_frame, camera_name):
+    def make_observer(observer_id, agent_frame, camera_name, seq_origin=0):
         return CameraObserver(
             observer_id,
             lambda f=agent_frame, c=camera_name: jpeg_to_camera_frame(f, c),
             camera_name, client, lift_box, keys[observer_id],
-            session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_query)
+            session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_query,
+            period_us=500_000, seq_origin=seq_origin)
 
     observer_rsu2 = make_observer("rsu-2", rsu, pick.camera_name)
     observer_rsu1 = make_observer("rsu-1", other, covering_cam)
-    ego_cam = "cam1" if "cam1" in ego.cameras else sorted(ego.cameras)[0]
-    observer_ego = make_observer("ego", ego, ego_cam)
-    cameras = {"rsu-2": observer_rsu2, "rsu-1": observer_rsu1, "ego": observer_ego}
+    ego_cams = tuple(name for name in ("cam1", "cam2", "cam3", "cam4") if name in ego.cameras)
+    if not ego_cams:
+        ego_cams = (sorted(ego.cameras)[0],)
+    ego_observers = [
+        make_observer("ego", ego, cam, seq_origin=index * 100)
+        for index, cam in enumerate(ego_cams)]
+    cameras = {"rsu-2": observer_rsu2, "rsu-1": observer_rsu1, "ego": ego_observers[0]}
     published_refs: dict[str, ObservationMessage] = {}
 
     def publish_message(message, *, scene_time_us: int | None = None) -> None:
@@ -854,11 +859,11 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
                        sim_us=message.envelope.generation_time_us,
                        message_id=message.envelope.message_id, message_type="observation")
 
-    # Fast path: both RSUs and the ego's own camera. Ego detections are local.
+    # Fast path: both RSUs and every ego camera. Ego detections are local.
     capture_us = rsu.nominal_time_us
     publish_us = capture_us
     last_avail = capture_us
-    for obs in (observer_rsu2, observer_rsu1, observer_ego):
+    for obs in (observer_rsu2, observer_rsu1, *ego_observers):
         for message in obs.observe():
             publish_message(message)
             publish_us = max(publish_us, message.envelope.generation_time_us)
@@ -916,7 +921,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         try:
             answer, at_us = observer.on_query(query, caps[observer_id], plan_avail)
         except (MetaAPIError, CacheMiss, BudgetExceeded) as exc:
-            raise ObserverUnavailable(type(exc).__name__) from exc
+            raise ObserverUnavailable(f"{type(exc).__name__}: {exc}") from exc
         for message in observer.published[before:]:
             publish_message(message, scene_time_us=query.time_us)
         answer_times[query.query_id] = at_us
@@ -934,7 +939,8 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     })
     events.extend(observer_rsu2.drain_events())
     events.extend(observer_rsu1.drain_events())
-    events.extend(observer_ego.drain_events())
+    for obs in ego_observers:
+        events.extend(obs.drain_events())
     answers_us = plan_avail
     for answer in raw_answers:
         answers_us = max(answers_us, answer_times.get(answer.query_id, plan_avail) + delay_us)
@@ -1015,8 +1021,8 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         "reasoner_rejections": list(reasoner.rejections),
         "rsu2_published": len(observer_rsu2.published),
         "rsu1_published": len(observer_rsu1.published),
-        "ego_published": len(observer_ego.published),
-        "ego_camera": ego_cam,
+        "ego_published": sum(len(obs.published) for obs in ego_observers),
+        "ego_cameras": list(ego_cams),
         "rsu1_camera": covering_cam,
         "rsu1b_camera": gap_cam,
         "snapshot_accepted": sum(

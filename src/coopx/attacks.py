@@ -9,7 +9,9 @@ synthetic S2 free-space point.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
+from coopx.coverage import CoverageContent, CoverageMessage, GridSpec
 from coopx.domain import ObjectClass, Observation, PositionAnchor
 from coopx.envelope import (Auth, Envelope, Lineage, ObservationMessage, decode,
                             encode, evidence_ref, sign)
@@ -92,9 +94,15 @@ def plan_attack(kind: str, *, seed: int, scene: dict, now_us: int,
         "class_flip": lambda: _one("ghost", target, ObjectClass.VEHICLE, now_us, seed),
         "sybil": lambda: _many("sybil", SYBIL_N, target, ObjectClass.PEDESTRIAN, now_us, seed,
                                TrustClass.B, False),
-        "majority_veto": lambda: _many("veto", VETO_K, target, ObjectClass.UNKNOWN, now_us, seed,
-                                       TrustClass.B, False),
-        "remote_clear": lambda: _one("clear", ego_local, ObjectClass.UNKNOWN, now_us, seed),
+        # Absence: "nothing is here", not another object. Unanchored peers have
+        # no physical body at the target, so they cannot have seen it.
+        "majority_veto": lambda: _free_peers(
+            "veto", VETO_K, target, now_us, seed, scene_grid((target, ego_local)),
+            TrustClass.B, False),
+        # One remote lidar claim that the ego detection's cell is empty.
+        "remote_clear": lambda: _free_peers(
+            "clear", 1, ego_local, now_us, seed, scene_grid((target, ego_local)),
+            TrustClass.A, True),
         "relay_dup": lambda: _relays(target, now_us, seed),
     }
     nodes, packets = builders[kind]()
@@ -126,6 +134,17 @@ def attack_anchors(plan: AttackPlan, *, region):
             physical_observer=node.name if node.anchored else None,
             permitted_region=region, anchored=node.anchored)
     return keys, anchors
+
+
+def scene_grid(points) -> GridSpec:
+    """One-metre grid covering every attacked point. Deterministic from those points."""
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    origin_x = math.floor(min(xs)) - 1.0
+    origin_y = math.floor(min(ys)) - 1.0
+    nx = int(math.ceil(max(xs)) - origin_x) + 2
+    ny = int(math.ceil(max(ys)) - origin_y) + 2
+    return GridSpec(origin_x, origin_y, 1.0, max(nx, 1), max(ny, 1))
 
 
 def _free_xyz(scene: dict):
@@ -184,6 +203,27 @@ def _many(prefix, count, xyz, cls, now_us, seed, trust, anchored):
         packets.append(_sign(
             name, seed, object_id=500 + index, capture_us=now_us, publish_us=now_us,
             cls=cls, xyz=xyz, message_id=f"{name}-{seed}"))
+    return tuple(nodes), tuple(packets)
+
+
+def _free_peers(prefix, count, xyz, now_us, seed, spec, trust, anchored):
+    """Signed lidar coverage: the cell under xyz is observed and free."""
+    cell = spec.cell_at(xyz[0], xyz[1])
+    nodes, packets = [], []
+    for index in range(count):
+        name = prefix if count == 1 else f"{prefix}-{index}"
+        nodes.append(AttackNode(name, trust, anchored))
+        content = CoverageContent(
+            spec, (now_us, now_us), "lidar", (0.2, 2.0), 0.3,
+            frozenset({cell}), frozenset({cell}), frozenset())
+        key = demo_node_key(seed, name)
+        message_id = f"{name}-{seed}"
+        envelope = Envelope(
+            2, "coverage", message_id, name, SESSION, FRAME,
+            now_us, now_us, now_us + TTL_US, Auth(f"{name}-key"), 1)
+        lineage = Lineage(name, "lidar", message_id, now_us, "direct")
+        message = sign(CoverageMessage(envelope, content, lineage), key)
+        packets.append(AttackPacket(name, encode(message), now_us, message_id, "coverage"))
     return tuple(nodes), tuple(packets)
 
 

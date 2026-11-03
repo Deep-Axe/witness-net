@@ -38,15 +38,54 @@ def render_summary(runs: list[dict]) -> str:
         "miner has landed; otherwise this table is the fixture only.",
         "",
         "Fusion `geo` and `witness` use `coopx.eval.fusion` when that module imports, and a",
-        "labelled stub otherwise. The stub does not apply real-LiDAR free-space contradiction.",
-        "Muse fusion is S4b and is absent here.",
+        "labelled stub otherwise. Muse fusion is S4b and is absent here.",
         "",
-        "| scene | fusion | attack | stub | occluded recall | precision | false hazards | flips | caught | messages | roots | partial |",
+        "Absence attacks (`majority_veto`, `remote_clear`) are signed lidar coverage claiming",
+        "cells empty, not extra objects. The stub agrees with Agent A's fuse on this:",
+        "union deletes every belief in any admitted free cell, including the ego's;",
+        "geo deletes a belief only when two evidence-eligible range observers claim that cell free;",
+        "witness never deletes a local belief.",
+        "",
+        "`replay_refreshed` is marked not caught in every mode on purpose: the packet carries",
+        "a fresh capture time and the attacker's own valid signature, so the freshness check",
+        "cannot reject it.",
+        "",
+        "`independent_witnesses` is EvidenceStore's rule: unanchored identities count as zero,",
+        "and relays of one anchored observation count once.",
+        "",
+        "Main rows use SAM perception. `gt-oracle` places detections on the ground truth and",
+        "is only a comparison; it is not a result.",
+        "",
+    ]
+    lines.extend(_table(run for run in runs if run.get("perception", "sam") == "sam"))
+    oracle = [run for run in runs if run.get("perception") == "gt-oracle"]
+    if oracle:
+        lines.extend(["", "## Comparison: gt-oracle (not a result)", ""])
+        lines.extend(_table(oracle))
+    ego = _ego_note(runs)
+    if ego:
+        lines.extend(["", "## Ego camera on the tune frame", "", ego, ""])
+    lines.extend(["", "## Runs", ""])
+    for run in runs:
+        lines.append(f"- `{run.get('path', '')}`")
+    if any(run.get("error") for run in runs):
+        lines.extend(["", "## Errors", ""])
+        for run in runs:
+            if run.get("error"):
+                lines.append(f"- {run.get('perception')} {run.get('fusion')} {run.get('attack') or '—'}: {run['error']}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _table(runs) -> list[str]:
+    rows = list(runs)
+    lines = [
+        "| scene | fusion | attack | stub | occluded recall | precision | false hazards | flips | caught | messages | independent witnesses | partial |",
         "|---|---|---|---|---:|---:|---:|---:|---|---:|---:|---|",
     ]
-    if not runs:
+    if not rows:
         lines.append("| — | — | — | — | — | — | — | — | — | — | — | — |")
-    for run in runs:
+    for run in rows:
         metrics = run.get("metrics") or {}
         scores = metrics.get("scores") or {}
         roots = metrics.get("independence") or {}
@@ -61,17 +100,10 @@ def render_summary(runs: list[dict]) -> str:
             flips=metrics.get("safety_flips", ""),
             caught=_caught(metrics.get("attack_caught")),
             messages=roots.get("messages", ""),
-            roots=roots.get("independent_roots", ""),
+            roots=roots.get("independent_witnesses", roots.get("independent_roots", "")),
             partial="yes" if run.get("partial") else "no",
         ))
-    ego = _ego_note(runs)
-    if ego:
-        lines.extend(["", "## Ego camera on the tune frame", "", ego, ""])
-    lines.extend(["", "## Runs", ""])
-    for run in runs:
-        lines.append(f"- `{run.get('path', '')}`")
-    lines.append("")
-    return "\n".join(lines)
+    return lines
 
 
 def write_summary(results_dir: Path, out: Path) -> str:
