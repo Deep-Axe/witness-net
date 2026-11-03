@@ -176,6 +176,12 @@ def _ordered_events(events: list[dict]) -> list[dict]:
     return [item[3] for item in tagged]
 
 
+def _require_output(path: Path, overwrite: bool) -> None:
+    """Fail before any dataset, model or file work if the log would be refused."""
+    if Path(path).exists() and not overwrite:
+        raise FileExistsError(f"{path} exists; pass --overwrite to replace it")
+
+
 def _write_events(path: Path, events: list[dict], *, overwrite: bool = False) -> list[dict]:
     """Write via a same-directory temp file; replace only on success."""
     ordered = _ordered_events(events)
@@ -279,6 +285,7 @@ def run_s1(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
            jitter_us: int = 50_000, disconnect_at_us: int | None = None,
            checker=None, key_seed: int | None = None, overwrite: bool = False) -> dict:
     """Replay ~5 s at 10 Hz. `checker=` defaults to the real Checker over this run's anchors."""
+    _require_output(output, overwrite)
     if disconnect_at_us is not None and (type(disconnect_at_us) is not int or disconnect_at_us < 0):
         raise ValueError("disconnect_at_us must be a nonnegative int")
     keys, anchors = _anchors_and_keys(key_seed=key_seed)
@@ -347,6 +354,7 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
     Every packet goes through the real Checker. Admitted coverage feeds the
     CoverageMap; admitted observations are judged by the Assessor.
     """
+    _require_output(output, overwrite)
     trust = {
         "pole1": TrustClass.A, "pole2": TrustClass.A, "pole3": TrustClass.A,
         "lidar1": TrustClass.A, "ego": TrustClass.A,
@@ -613,14 +621,16 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     The fast path (SAM -> lift -> checker -> assessment) never waits on Spark;
     every model result enters the log at its availability time.
     """
+    _require_output(output, overwrite)
     from coopx.dataset.v2xreal import V2XReal, camera_footprint_xy, point_in_polygon
     from coopx.envelope import encode, evidence_ref
-    from coopx.meta.client import MetaClient, model_call_event
-    from coopx.meta.reasoner import Reasoner, execute
+    from coopx.meta.client import (BudgetExceeded, CacheMiss, MetaAPIError, MetaClient,
+                                   model_call_event)
+    from coopx.meta.reasoner import ObserverUnavailable, Reasoner, execute
     from coopx.observers.camera import (CameraObserver, jpeg_to_camera_frame,
                                        rsu_camera_capability)
     from coopx.observers.camera_lift import lift_box
-    from coopx.query import answer_query
+    from coopx.query import Answer, answer_query
 
     pick = pick_s3_frame(dataset_root)
     dataset = V2XReal(dataset_root)
@@ -662,6 +672,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     events: list[dict] = []
     accepted = rejected = 0
     admitted: list = []
+    accepted_refs: dict[str, ObservationMessage] = {}
 
     def on_delivery(delivery: PacketDelivery) -> None:
         nonlocal accepted, rejected
@@ -676,6 +687,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         accepted += 1
         if isinstance(result.message, ObservationMessage):
             admitted.append(result.message)
+            accepted_refs[evidence_ref(result.message)] = result.message
             assessment = assessor.assess(result.message, now_us)
             events.append(_assessment_event(
                 result.message, assessment, delivery.evidence_ref, now_us,
@@ -736,19 +748,34 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
              "xy": [round(m.observation.xyz_m[0], 2), round(m.observation.xyz_m[1], 2)]}
             for m in admitted],
     }
-    reasoner = Reasoner(client)
+    def independent(refs):
+        # The deterministic witness rule (authenticated lineage, physical
+        # observer, common causes), applied to accepted evidence only.
+        messages = [accepted_refs[r] for r in refs if r in accepted_refs]
+        if not messages:
+            return 0
+        return max(store.independent_witnesses(m, messages) for m in messages)
+
+    reasoner = Reasoner(client, independent=independent)
     queries, plan_result = reasoner.plan(question, capabilities, context, t_q)
-    events.append(model_call_event(plan_result, "reasoner"))
+    plan_event = model_call_event(plan_result, "reasoner")
+    plan_event["detail"]["question"] = question
+    events.append(plan_event)
     plan_avail = plan_result.availability_time_us
     for query in queries:
-        events.append(query.to_event(plan_avail))
+        event = query.to_event(plan_avail)
+        event["detail"]["question"] = question
+        events.append(event)
 
     answer_times: dict[str, int] = {}
 
     def call_rsu2(query):
-        before = len(observer._admitted)
-        answer, at_us = observer.on_query(query, cap_rsu, plan_avail)
-        for message in observer._admitted[before:]:
+        before = len(observer.published)
+        try:
+            answer, at_us = observer.on_query(query, cap_rsu, plan_avail)
+        except (MetaAPIError, CacheMiss, BudgetExceeded) as exc:
+            raise ObserverUnavailable(type(exc).__name__) from exc
+        for message in observer.published[before:]:
             publish_message(message)
         answer_times[query.query_id] = at_us
         return answer
@@ -758,25 +785,41 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         answer_times[query.query_id] = plan_avail
         return answer_query(query, cap_other, [], [], plan_avail)
 
-    answers = execute(queries, capabilities, {"rsu-2": call_rsu2, "rsu-1": call_rsu1})
+    raw_answers = execute(queries, capabilities, {"rsu-2": call_rsu2, "rsu-1": call_rsu1})
     events.extend(observer.drain_events())
     answers_us = plan_avail
-    for answer in answers:
-        at_us = answer_times.get(answer.query_id, plan_avail) + delay_us
-        events.append(answer.to_event(at_us))
-        answers_us = max(answers_us, at_us)
+    for answer in raw_answers:
+        answers_us = max(answers_us, answer_times.get(answer.query_id, plan_avail) + delay_us)
+    # Finish transmission and checks before the asker uses any evidence.
     transport.receive_until(answers_us)
+
+    # The Reasoner sees only evidence its own checker accepted. An observer's
+    # claim backed by rejected or undelivered packets is not evidence here.
+    answers = []
+    for answer in raw_answers:
+        kept = tuple(r for r in answer.evidence_refs if r in accepted_refs)
+        withheld = [r for r in answer.evidence_refs if r not in accepted_refs]
+        if answer.result == "detected" and not kept:
+            accepted_answer = Answer(answer.query_id, answer.observer_id, "unavailable",
+                                     None, None, ())
+        else:
+            accepted_answer = Answer(answer.query_id, answer.observer_id, answer.result,
+                                     answer.observed_time_us, answer.coverage_ref, kept)
+        answers.append(accepted_answer)
+        event = accepted_answer.to_event(answers_us)
+        event["detail"]["observer_result"] = answer.result
+        event["detail"]["withheld_refs"] = withheld
+        events.append(event)
 
     evidence = {}
     for answer in answers:
         for ref in answer.evidence_refs:
-            message = published_refs.get(ref)
-            if message is None:
-                continue
+            message = accepted_refs[ref]
             o = message.observation
             evidence[ref] = {
                 "source_id": message.envelope.source_id, "object_id": o.object_id,
                 "message_id": message.envelope.message_id, "class": o.cls.name,
+                "label": observer.labels.get(message.label_id) if message.label_id else None,
                 "xy": [round(o.xyz_m[0], 2), round(o.xyz_m[1], 2)],
                 "capture_time_us": message.envelope.capture_time_us,
                 "availability_time_us": message.envelope.generation_time_us,
@@ -787,7 +830,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         events.append(verdict.to_event(judge_result.availability_time_us))
 
     try:
-        _write_s3_overlay(overlay, rsu, pick.camera_name, observer.last_detections, pedestrian)
+        _write_s3_overlay(overlay, rsu, pick.camera_name, observer.fast_path_detections, pedestrian)
     except OSError:
         pass
 
@@ -809,6 +852,8 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         "model_call_count": by_type.get("model_call", 0),
         "model_cost_usd": model_cost,
         "question": question,
+        "withheld_refs": sum(len(e["detail"].get("withheld_refs", [])) for e in events
+                             if e["type"] == "answer"),
         "overlay": str(overlay),
         "grid": _grid_dict(grid),
         "checker": type(checker).__name__,

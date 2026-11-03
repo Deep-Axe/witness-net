@@ -65,6 +65,14 @@ function isCell(value) {
   return Array.isArray(value) && value.length === 2 && isInt(value[0]) && isInt(value[1]);
 }
 
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isRefList(value) {
+  return Array.isArray(value) && value.every(isHex64);
+}
+
 function isNonemptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -128,17 +136,30 @@ function validate(event, index) {
     if (event.message_type !== "query" || !event.dest_id || !event.message_id) return `line ${index}: query id`;
     if (!QUERY_TIERS.has(event.detail.tier)) return `line ${index}: query tier`;
     const region = event.detail.region;
-    if (!region || !Array.isArray(region.center) || region.center.length !== 2) return `line ${index}: query region`;
+    if (!region || !Array.isArray(region.center) || region.center.length !== 2
+        || !region.center.every(isFiniteNumber) || !isFiniteNumber(region.radius_m)
+        || region.radius_m <= 0) return `line ${index}: query region`;
+    if (!isInt(event.detail.time_us) || event.detail.time_us < 0) return `line ${index}: query time`;
+    if (event.detail.concept != null && typeof event.detail.concept !== "string") return `line ${index}: query concept`;
+    if (typeof event.detail.reason !== "string") return `line ${index}: query reason`;
+    if (event.detail.question != null && typeof event.detail.question !== "string") return `line ${index}: query question`;
   } else if (event.type === "answer") {
     if (!ANSWER_RESULTS.has(event.state) || event.check_codes.length) return `line ${index}: answer state`;
     if (event.message_type !== "answer" || !event.dest_id || !event.message_id) return `line ${index}: answer id`;
-    if (!Array.isArray(event.detail.evidence_refs)) return `line ${index}: answer refs`;
+    if (!isRefList(event.detail.evidence_refs)) return `line ${index}: answer refs`;
+    if (event.detail.coverage_ref != null && !isHex64(event.detail.coverage_ref)) return `line ${index}: answer coverage_ref`;
+    if (event.detail.withheld_refs != null && !isRefList(event.detail.withheld_refs)) return `line ${index}: answer withheld`;
+    if (event.state === "detected" && !event.detail.evidence_refs.length) return `line ${index}: detected without refs`;
   } else if (event.type === "verdict") {
     if (!VERDICT_STATES.has(event.state) || event.check_codes.length) return `line ${index}: verdict state`;
     if (event.message_type !== "verdict" || !event.message_id) return `line ${index}: verdict id`;
-    if (!isNonemptyString(event.detail.subject) || !Array.isArray(event.detail.evidence_refs)) {
+    if (!isNonemptyString(event.detail.subject) || !isRefList(event.detail.evidence_refs)
+        || typeof event.detail.reason !== "string"
+        || !Array.isArray(event.detail.model_call_ids)
+        || !event.detail.model_call_ids.every(isNonemptyString)) {
       return `line ${index}: verdict detail`;
     }
+    if (event.state !== "unverified" && !event.detail.evidence_refs.length) return `line ${index}: verdict without refs`;
   } else if (event.type === "model_call") {
     if (event.state != null || event.check_codes.length) return `line ${index}: model_call state`;
     if (!event.message_id) return `line ${index}: model_call id`;
@@ -147,6 +168,11 @@ function validate(event, index) {
     if (typeof d.cache_hit !== "boolean" || event.t_replay_us !== d.availability_time_us) {
       return `line ${index}: model_call time honesty`;
     }
+    if (!isFiniteNumber(d.latency_ms) || d.latency_ms < 0 || !isFiniteNumber(d.cost_usd) || d.cost_usd < 0
+        || !isInt(d.query_time_us) || d.query_time_us > d.availability_time_us) {
+      return `line ${index}: model_call accounting`;
+    }
+    if (d.question != null && typeof d.question !== "string") return `line ${index}: model_call question`;
   } else if (event.state != null || event.check_codes.length) {
     return `line ${index}: unexpected state/codes`;
   }
@@ -549,9 +575,11 @@ function renderReasoner() {
   if (!host) return;
   clear(host);
   const evs = until(state.t);
+  const asked = evs.find((e) => (e.type === "query" || e.type === "model_call")
+    && typeof e.detail.question === "string");
   const question = evs.find((e) => e.type === "query");
   host.appendChild(el("h3", "", "Question"));
-  host.appendChild(el("p", "", question
+  host.appendChild(el("p", "", asked ? asked.detail.question : question
     ? (question.detail.reason || question.detail.concept || "region question")
     : "No query yet."));
   host.appendChild(el("h3", "", "Plan"));
@@ -592,7 +620,7 @@ function renderReasoner() {
   if (!calls.length) host.appendChild(el("p", "muted", "No model calls yet."));
   for (const event of calls) {
     const d = event.detail;
-    const line = `${d.product} ${d.stage} · ${d.latency_ms} ms · cache ${d.cache_hit} · $${d.cost_usd}`;
+    const line = `${d.product} ${d.stage} · ${Math.round(d.latency_ms)} ms · cache ${d.cache_hit} · $${d.cost_usd.toFixed(4)}`;
     host.appendChild(el("p", "", line));
   }
 }

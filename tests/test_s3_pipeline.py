@@ -41,6 +41,9 @@ class _FakeMeta:
                  "radius_m": region["radius_m"], "concept": "person", "reason": "covers it"},
                 {"tier": "T1", "observer_id": "rsu-9", "center_xy": region["center"],
                  "radius_m": 4.0, "concept": None, "reason": "invented observer"}]}
+        elif not data["evidence"]:
+            out = {"verdicts": [{"subject": data["queries"][0]["query_id"], "state": "corroborated",
+                                 "evidence_refs": [], "reason": "observer said detected"}]}
         else:
             ref = sorted(data["evidence"])[0]
             out = {"verdicts": [{"subject": data["evidence"][ref]["message_id"],
@@ -117,10 +120,13 @@ class S3PipelineTests(unittest.TestCase):
             verdict = next(e for e in events if e["type"] == "verdict")
             self.assertEqual(len(verdict["detail"]["evidence_refs"]), 1)
             self.assertEqual(len(verdict["detail"]["model_call_ids"]), 2)
-            hits = [e for e in events if e["type"] == "model_call" and e["detail"]["cache_hit"]]
-            self.assertTrue(hits)
-            self.assertTrue(all(e["detail"]["cost_usd"] == 0 and e["detail"]["latency_ms"] > 0
-                                for e in hits))
+            sam_calls = [e for e in events if e["type"] == "model_call"
+                         and e["detail"]["product"] == "sam-3.1"]
+            self.assertEqual(len(sam_calls), 1)  # T3 "person" reuses the fast path
+            plan = next(e for e in events if e["type"] == "model_call"
+                        and e["detail"]["stage"] == "plan")
+            self.assertEqual(plan["detail"]["question"], summary["question"])
+            self.assertEqual(summary["withheld_refs"], 0)
 
             published_refs = {}
             seen_query = {}
@@ -156,6 +162,47 @@ class S3PipelineTests(unittest.TestCase):
                 Path(tmp) / "cost.jsonl").is_file() else ""
             self.assertNotIn("fixture-key-not-secret", blob)
             self.assertNotIn("fixture-key-not-secret", path.read_text(encoding="utf-8"))
+
+
+    def _client(self, tmp, post, latency_s=0.4):
+        ticks = iter(range(10_000))
+        return MetaClient(cache_dir=Path(tmp) / "cache", cost_log=Path(tmp) / "cost.jsonl",
+                          post=post, environ={"MODEL_API_KEY": "fixture-key-not-secret"},
+                          clock=lambda: next(ticks) * latency_s)
+
+    def test_rejected_evidence_never_reaches_the_judge(self):
+        """Slow SAM (6 s > 5 s TTL): packets are STALE, so no accepted evidence."""
+        pick = pick_s3_frame(DATASET)
+        with tempfile.TemporaryDirectory() as tmp:
+            post = _FakeMeta(_sam_text_for_gt(pick))
+            path = Path(tmp) / "s3.jsonl"
+            summary = run_s3(path, client=self._client(tmp, post, latency_s=6.0),
+                             overwrite=True, overlay=Path(tmp) / "o.png", dataset_root=DATASET)
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+            rejected = {e["evidence_ref"] for e in events
+                        if e["type"] == "check" and e["state"] == "rejected"}
+            self.assertEqual(summary["accepted"], 0)
+            self.assertTrue(rejected)
+            for e in events:
+                if e["type"] in ("answer", "verdict"):
+                    self.assertFalse(set(e["detail"]["evidence_refs"]) & rejected)
+            answer = next(e for e in events if e["type"] == "answer")
+            self.assertEqual((answer["state"], answer["detail"]["observer_result"]),
+                             ("unavailable", "detected"))
+            self.assertTrue(answer["detail"]["withheld_refs"])
+            self.assertEqual([v["state"] for v in summary["verdicts"]], ["unverified"])
+
+    def test_existing_output_without_overwrite_spends_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            post = _FakeMeta("")
+            path = Path(tmp) / "s3.jsonl"
+            path.write_text("keep\n")
+            with self.assertRaises(FileExistsError):
+                run_s3(path, client=self._client(tmp, post), overlay=Path(tmp) / "o.png",
+                       dataset_root=DATASET)
+            self.assertEqual(post.calls, [])
+            self.assertEqual(path.read_text(), "keep\n")
+            self.assertFalse((Path(tmp) / "o.png").exists())
 
 
 if __name__ == "__main__":

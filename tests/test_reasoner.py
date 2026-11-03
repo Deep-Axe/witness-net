@@ -121,9 +121,15 @@ class ReasonerTests(unittest.TestCase):
 
     def test_observer_errors_or_mismatched_answers_fail_closed(self):
         query=Query('q','T1','pole',(1.,1.),1.,0,None,'')
+        from coopx.meta.reasoner import ObserverUnavailable
         def failed(q):
-            raise RuntimeError('observer unavailable')
+            raise ObserverUnavailable('link down')
         self.assertEqual(execute([query],[self.cap],{'pole':failed})[0].result,'unavailable')
+        # Anything else is a bug: it propagates instead of becoming 'unavailable'.
+        def buggy(q):
+            raise RuntimeError('lift bug')
+        with self.assertRaises(RuntimeError):
+            execute([query],[self.cap],{'pole':buggy})
         self.assertEqual(execute([query],[self.cap],{'pole':lambda q:Answer('wrong','pole','not_detected',0,None,())})[0].result,
                          'unavailable')
 
@@ -200,27 +206,71 @@ class FreePhraseTierTests(unittest.TestCase):
 
 
 class IndependentObserverTests(unittest.TestCase):
-    def test_corroboration_needs_two_source_ids(self):
+    """A model verdict cannot exceed the evidence: independent witnesses, typed roles."""
+
+    def judge(self, state, refs, evidence, answers, independent=None):
         from types import SimpleNamespace
         from coopx.meta.reasoner import Reasoner
-        from coopx.query import Answer, Query
-        a, b = "a" * 64, "b" * 64
-        query = Query("q1", "T1", "cam1", (1.0, 2.0), 3.0, 5, "person", "x")
-        answers = [Answer("q1", "cam1", "detected", 5, None, (a,))]
+        from coopx.query import Query
+        queries = [Query("q1", "T1", "cam1", (1.0, 2.0), 3.0, 5, "person", "x"),
+                   Query("q2", "T1", "cam2", (1.0, 2.0), 3.0, 5, "person", "x")]
 
-        def judge_with(refs, evidence):
-            class Client:
-                def respond(self, **kw):
-                    return SimpleNamespace(
-                        json={"verdicts": [{"subject": "q1", "state": "corroborated",
-                                            "evidence_refs": refs, "reason": "seen"}]},
-                        text="", call_id="j1", availability_time_us=kw["query_time_us"] + 1)
-            verdicts, _ = Reasoner(Client()).judge("anyone?", [query], answers, evidence, 10)
-            return verdicts[0].state
+        class Client:
+            def respond(self, **kw):
+                return SimpleNamespace(
+                    json={"verdicts": [{"subject": "q1", "state": state,
+                                        "evidence_refs": refs, "reason": "seen"}]},
+                    text="", call_id="j1", availability_time_us=kw["query_time_us"] + 1)
+        reasoner = Reasoner(Client(), independent=independent)
+        verdicts, _ = reasoner.judge("anyone?", queries, answers, evidence, 10)
+        return verdicts[0].state, [r["code"] for r in reasoner.rejections]
 
-        one = {a: {"source_id": "cam1", "availability_time_us": 5}}
-        two = {**one, b: {"source_id": "cam2", "availability_time_us": 5}}
-        same = {**one, b: {"source_id": "cam1", "availability_time_us": 5}}
-        self.assertEqual(judge_with([a], one), "unverified")
-        self.assertEqual(judge_with([a, b], same), "unverified")
-        self.assertEqual(judge_with([a, b], two), "corroborated")
+    def setUp(self):
+        from coopx.query import Answer
+        self.a, self.b, self.c = "a" * 64, "b" * 64, "c" * 64
+        self.answers = [Answer("q1", "cam1", "detected", 5, None, (self.a,)),
+                        Answer("q2", "cam2", "detected", 5, None, (self.b,))]
+
+    def ev(self, **bodies):
+        return {ref: {"availability_time_us": 5, **body} for ref, body in bodies.items()}
+
+    def test_one_observer_cannot_corroborate(self):
+        evidence = self.ev(**{self.a: {"source_id": "cam1"}})
+        self.assertEqual(self.judge("corroborated", [self.a], evidence, self.answers[:1])[0],
+                         "unverified")
+
+    def test_two_independent_observers_corroborate(self):
+        evidence = self.ev(**{self.a: {"source_id": "cam1"}, self.b: {"source_id": "cam2"}})
+        self.assertEqual(self.judge("corroborated", [self.a, self.b], evidence, self.answers)[0],
+                         "corroborated")
+
+    def test_two_relays_of_one_origin_are_one_witness(self):
+        evidence = self.ev(**{
+            self.a: {"source_id": "relay-a", "physical_observer": "pole", "origin_message_id": "m1"},
+            self.b: {"source_id": "relay-b", "physical_observer": "pole", "origin_message_id": "m1"}})
+        state, codes = self.judge("corroborated", [self.a, self.b], evidence, self.answers)
+        self.assertEqual((state, codes), ("unverified", ["SINGLE_SOURCE_CORROBORATION"]))
+        # Different bodies but a shared origin also collapse.
+        evidence[self.b]["physical_observer"] = "other-pole"
+        self.assertEqual(self.judge("corroborated", [self.a, self.b], evidence, self.answers)[0],
+                         "unverified")
+
+    def test_store_counter_overrides_summaries(self):
+        evidence = self.ev(**{self.a: {"source_id": "cam1"}, self.b: {"source_id": "cam2"}})
+        state, _ = self.judge("corroborated", [self.a, self.b], evidence, self.answers,
+                              independent=lambda refs: 1)
+        self.assertEqual(state, "unverified")
+
+    def test_contested_needs_detection_and_free_space(self):
+        from coopx.query import Answer
+        evidence = self.ev(**{self.a: {"source_id": "cam1"}, self.b: {"source_id": "cam2"},
+                              self.c: {"source_id": "lidar"}})
+        state, codes = self.judge("contested", [self.a, self.b], evidence, self.answers)
+        self.assertEqual((state, codes), ("unverified", ["CONTESTED_WITHOUT_BOTH_ROLES"]))
+        answers = [self.answers[0], Answer("q2", "cam2", "observed_free", 5, self.c, ())]
+        self.assertEqual(self.judge("contested", [self.a, self.c], evidence, answers)[0],
+                         "contested")
+
+
+if __name__ == "__main__":
+    unittest.main()

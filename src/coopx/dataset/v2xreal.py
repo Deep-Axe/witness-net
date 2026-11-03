@@ -166,22 +166,12 @@ def box_fully_in_camera(frame: AgentFrame, box: GroundTruthBox, camera_name: str
 
 
 def point_in_polygon(point: tuple[float, float], polygon: tuple[tuple[float, float], ...]) -> bool:
-    """Inclusive ray-crossing test for a simple polygon."""
+    """Inclusive point-in-polygon; one implementation shared with query answers."""
+    from coopx.query import inside_polygon
     if len(polygon) < 3:
         return False
-    x, y = point
-    inside = False
-    x0, y0 = polygon[-1]
-    for x1, y1 in polygon:
-        if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 0.0) + x0):
-            inside = not inside
-        if abs((x1 - x0) * (y - y0) - (x - x0) * (y1 - y0)) <= 1e-9:
-            lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
-            lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
-            if lo_x - 1e-9 <= x <= hi_x + 1e-9 and lo_y - 1e-9 <= y <= hi_y + 1e-9:
-                return True
-        x0, y0 = x1, y1
-    return inside
+    return inside_polygon((float(point[0]), float(point[1])),
+                          tuple((float(x), float(y)) for x, y in polygon))
 
 
 def camera_footprint_xy(frame: AgentFrame, camera_name: str, *,

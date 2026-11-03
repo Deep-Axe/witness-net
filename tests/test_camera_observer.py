@@ -87,10 +87,48 @@ class CameraObserverTests(unittest.TestCase):
             cap = Capability("rsu-2", ("camera_rgb",), ("T0", "T1", "T2", "T3"), "open",
                              ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)))
             answer, at_us = observer.on_query(query, cap, 1_250_000)
-            # T3 reruns SAM on receipt (cache hit replays its 250 ms latency).
-            self.assertEqual(at_us, 1_500_000)
+            # Same frame, same concept: reuse the fast-path detections, no new
+            # SAM call and no re-signed duplicates.
+            self.assertEqual(at_us, 1_250_000)
+            self.assertEqual(observer.drain_events(), [])
+            self.assertEqual(len(observer.published), 1)
             self.assertEqual(answer.result, "detected")
             self.assertIn(evidence_ref(messages[0]), answer.evidence_refs)
+
+    def test_new_concepts_are_found_and_stay_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            box = "<0f>0<|box;x1=8;y1=8;x2=24;y2=24;w=32;h=32|>"
+            post = _FakePost([_ok(box, images=1), _ok(box, images=1)])
+            client = MetaClient(cache_dir=Path(tmp) / "c", cost_log=Path(tmp) / "cost.jsonl",
+                                post=post, environ={"MODEL_API_KEY": "k"},
+                                clock=iter([0.0, 0.1, 1.0, 1.1]).__next__)
+            spots = iter([(3.0, 4.0, 0.5), (7.0, 7.0, 0.5)])
+
+            def lift_fn(*_args, **_kwargs):
+                return Lifted(next(spots), (0.6, 0.6, 1.0), (0.1, 0.1, 0.1), 8,
+                              PositionAnchor.SURFACE)
+
+            class DummyFrame:
+                cameras = {"cam1": None}
+
+            observer = CameraObserver(
+                "rsu-2", lambda: CameraFrame(_tiny_png(), (32, 32), 1_000_000, DummyFrame(), "cam1"),
+                "cam1", client, lift_fn, demo_node_key(1, "rsu-2"), ttl_us=5_000_000,
+                concepts=())
+            cap = Capability("rsu-2", ("camera_rgb",), ("T3",), "open",
+                             ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)))
+            trash, _ = observer.on_query(
+                Query("q1", "T3", "rsu-2", (3.0, 4.0), 1.0, 1_000_000, "trash can", "x"),
+                cap, 1_000_000)
+            cone, _ = observer.on_query(
+                Query("q2", "T3", "rsu-2", (3.0, 4.0), 1.0, 1_000_000, "traffic cone", "x"),
+                cap, 1_000_000)
+            self.assertEqual(trash.result, "detected")
+            # The cone was found at (7, 7); the trash can at (3, 4) is not a cone.
+            self.assertEqual(cone.result, "not_detected")
+            labels = {m.label_id for m in observer.published}
+            self.assertEqual(len(labels), 2)
+            self.assertEqual(sorted(observer.labels.values()), ["traffic cone", "trash can"])
 
     def test_lift_needs_min_points(self):
         with tempfile.TemporaryDirectory() as tmp:

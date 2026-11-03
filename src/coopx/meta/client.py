@@ -27,6 +27,8 @@ SAM_IMAGE_USD = 2.50 / 1_000
 DEFAULT_BUDGET_USD = 3.0
 DEFAULT_TIMEOUT_S = 45.0
 MAX_RETRIES = 2
+# Hard cap on Spark output (incl. reasoning) so a call's worst-case cost is bounded.
+SPARK_MAX_OUTPUT_TOKENS = 4000
 
 
 class CacheMiss(Exception):
@@ -242,13 +244,26 @@ class MetaClient:
         with self.cost_log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
 
-    def _refuse_if_over_budget(self, product: str) -> None:
+    @staticmethod
+    def reserve_usd(product: str, *, instructions: str, input) -> float:
+        """Worst-case cost of the next call, reserved before dispatch.
+
+        SAM bills per image. Spark: input tokens bounded by serialized bytes
+        (one token per 2 bytes, conservative; images priced as text bytes) plus
+        the full output cap at the output rate.
+        """
+        if product == "sam-3.1":
+            return SAM_IMAGE_USD
+        size = len(instructions.encode("utf-8")) + len(
+            json.dumps(input, allow_nan=False, sort_keys=True).encode("utf-8"))
+        return (size / 2) * SPARK_IN_USD + SPARK_MAX_OUTPUT_TOKENS * SPARK_OUT_USD
+
+    def _refuse_if_over_budget(self, product: str, reserve: float) -> None:
         logged = self.logged_cost_usd()
-        extra = SAM_IMAGE_USD if product == "sam-3.1" else 0.0
-        if logged + extra > self.budget_usd + 1e-12:
+        if self.budget_usd <= 0 or logged + reserve > self.budget_usd + 1e-12:
             raise BudgetExceeded(
-                f"logged cost {logged:.6f} USD plus the next {product} call "
-                f"would exceed budget {self.budget_usd:.4f} USD")
+                f"logged cost {logged:.6f} USD plus a {reserve:.6f} USD reservation for "
+                f"the next {product} call would exceed budget {self.budget_usd:.4f} USD")
 
     def _live_call(self, *, model: str, instructions: str, input, text_format,
                    reasoning_effort: str) -> dict:
@@ -269,6 +284,7 @@ class MetaClient:
             }
             if text_format is not None:
                 payload["text"] = {"format": text_format}
+            payload["max_output_tokens"] = SPARK_MAX_OUTPUT_TOKENS
             accept = "application/json"
         body = json.dumps(payload, allow_nan=False).encode("utf-8")
         headers = {
@@ -339,7 +355,9 @@ class MetaClient:
                 precomputed=precomputed, stage=stage)
         if self.offline:
             raise CacheMiss(f"no cached response for {model} ({stage})")
-        self._refuse_if_over_budget(model)
+        # Every attempt may be billed (a timed-out request is not proof of no charge).
+        reserve = self.reserve_usd(model, instructions=instructions, input=input) * (1 + MAX_RETRIES)
+        self._refuse_if_over_budget(model, reserve)
         started = self._clock()
         payload = self._live_call(
             model=model, instructions=instructions, input=input,

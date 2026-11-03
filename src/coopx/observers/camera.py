@@ -24,6 +24,8 @@ from coopx.observers.camera_lift import Lifted, lift_box
 from coopx.query import (CLASS_CONCEPTS, Answer, Capability, Query, answer_query,
                         normalize_concept)
 
+MAX_LABELS = 64
+
 def rsu_camera_capability(observer_id: str, frame: AgentFrame, camera_name: str) -> Capability:
     return Capability(
         observer_id, ("camera_rgb",), ("T0", "T1", "T2", "T3"), "open",
@@ -69,18 +71,46 @@ class CameraObserver:
         self.answer_fn = answer_fn
         self._seq = 0
         self._latest: CameraFrame | None = None
-        self._admitted: list[ObservationMessage] = []
+        # What THIS observer signed and sent. Not "admitted": only the
+        # receiving consumer's checker decides that.
+        self.published: list[ObservationMessage] = []
         self._events: list[dict] = []
         self.last_detections: list[Detection] = []
+        self.fast_path_detections: list[Detection] = []
         self.last_result: ModelResult | None = None
+        # Bounded dynamic label table for open-vocabulary concepts: label_id is
+        # signed into each observation so "trash can" stays distinct from any
+        # other UNKNOWN object (contract: concepts are data, never instructions).
+        self.labels: dict[int, str] = {}
+        self._label_ids: dict[str, int] = {}
+        # (frame capture, concept) already segmented: reuse, never re-sign.
+        self._segmented: dict[tuple[int, str], ModelResult] = {}
+
+    def _next_object_id(self) -> int:
+        self._object_seq = getattr(self, "_object_seq", 199) + 1
+        return self._object_seq
 
     def _next_seq(self) -> int:
         value = self._seq
         self._seq += 1
         return value
 
+    def label_for(self, concept: str) -> int | None:
+        """Fixed classes need no label; other phrases get a bounded label id."""
+        normalized = normalize_concept(concept.strip())
+        if normalized in CLASS_CONCEPTS:
+            return None
+        if normalized not in self._label_ids:
+            if len(self._label_ids) >= MAX_LABELS:
+                raise ValueError("label table full")
+            label_id = len(self._label_ids) + 1
+            self._label_ids[normalized] = label_id
+            self.labels[label_id] = normalized
+        return self._label_ids[normalized]
+
     def _sign(self, xyz, cls: ObjectClass, capture_us: int, object_id: int,
-              publish_us: int, std=None, dimensions=None) -> ObservationMessage:
+              publish_us: int, std=None, dimensions=None,
+              label_id: int | None = None) -> ObservationMessage:
         sequence = self._next_seq()
         observation = Observation(
             self.observer_id, object_id, sequence, capture_us, cls, xyz,
@@ -93,15 +123,21 @@ class CameraObserver:
             Auth(f"{self.observer_id}-key"), sequence)
         lineage = Lineage(self.observer_id, self.camera_name, message_id, capture_us,
                           derivation="direct")
-        return sign(ObservationMessage(envelope, observation, lineage, Kind.PERCEIVED),
-                    self.key)
+        return sign(ObservationMessage(envelope, observation, lineage, Kind.PERCEIVED,
+                                       label_id=label_id), self.key)
 
     def _detect(self, frame: CameraFrame, concept: str, query_time_us: int):
+        key = (frame.capture_us, normalize_concept(concept.strip()))
+        if key in self._segmented:
+            # Same frame, same concept: the detections are already signed and sent.
+            return [], self._segmented[key]
+        label_id = self.label_for(concept)
         detections, result = segment(
             self.client, frame.image_png, concept,
             image_size=frame.image_size, query_time_us=query_time_us)
         self.last_detections = detections
         self.last_result = result
+        self._segmented[key] = result
         self._events.append(model_call_event(result, self.observer_id))
         messages = []
         for index, detection in enumerate(detections):
@@ -110,10 +146,10 @@ class CameraObserver:
                 continue
             cls = CLASS_CONCEPTS.get(normalize_concept(concept.strip()), ObjectClass.UNKNOWN)
             message = self._sign(
-                lifted.xyz_site, cls, frame.capture_us, 200 + index,
-                result.availability_time_us, lifted.std_m, lifted.extent_m)
+                lifted.xyz_site, cls, frame.capture_us, self._next_object_id(),
+                result.availability_time_us, lifted.std_m, lifted.extent_m, label_id)
             messages.append(message)
-            self._admitted.append(message)
+            self.published.append(message)
         return messages, result
 
     def drain_events(self) -> list[dict]:
@@ -130,13 +166,15 @@ class CameraObserver:
         for concept in self.concepts:
             messages, _result = self._detect(frame, concept, frame.capture_us)
             published.extend(messages)
+        self.fast_path_detections = list(self.last_detections)
         return published
 
     def on_query(self, query: Query, capability: Capability, now_us: int) -> tuple[Answer, int]:
         """Answer a query received at `now_us`; returns (answer, time it exists).
 
         A T3 query runs SAM with its concept when received; new detections and
-        the answer exist only once that SAM result is available.
+        the answer exist only once that SAM result is available. A concept
+        already segmented on this frame reuses that result (no second call).
         """
         frame = self._latest or self.frame_source()
         if frame is None:
@@ -144,9 +182,11 @@ class CameraObserver:
         self._latest = frame
         answered_at = now_us
         if query.tier == "T3" and query.concept:
-            _messages, result = self._detect(frame, query.concept.strip(), now_us)
-            answered_at = max(answered_at, result.availability_time_us)
-        answer = self.answer_fn(query, capability, list(self._admitted), [], answered_at)
+            messages, result = self._detect(frame, query.concept.strip(), now_us)
+            if messages:
+                answered_at = max(answered_at, result.availability_time_us)
+        answer = self.answer_fn(query, capability, list(self.published), [], answered_at,
+                                labels=dict(self.labels))
         return answer, answered_at
 
 

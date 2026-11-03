@@ -85,6 +85,25 @@ class MetaClientTests(unittest.TestCase):
                              input=[{"role": "user", "content": [{"type": "input_text", "text": "p"}]}],
                              query_time_us=0, stage="segment")
 
+    def test_spark_reserves_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            post = FakePost([_ok("x")])
+            zero = self._client(tmp, post, budget_usd=0.0)
+            with self.assertRaises(BudgetExceeded):
+                zero.respond(model="muse-spark-1.3", instructions="i", input="probe",
+                             query_time_us=0, stage="plan")
+            # Below the worst-case reservation (4000-token cap, 3 attempts): refused.
+            tight = self._client(tmp, post, budget_usd=0.01)
+            with self.assertRaises(BudgetExceeded):
+                tight.respond(model="muse-spark-1.3", instructions="i", input="probe",
+                              query_time_us=0, stage="plan")
+            self.assertEqual(post.requests, [])
+            ok = self._client(tmp, post, budget_usd=1.0)
+            ok.respond(model="muse-spark-1.3", instructions="i", input="probe",
+                       query_time_us=0, stage="plan")
+            body = json.loads(post.requests[0]["body"])
+            self.assertEqual(body["max_output_tokens"], 4000)
+
     def test_5xx_retries_4xx_does_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             err500 = urllib.error.HTTPError(

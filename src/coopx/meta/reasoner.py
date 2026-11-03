@@ -70,10 +70,21 @@ def _subjects(ref, summary):
 
 
 class Reasoner:
-    def __init__(self, client, *, model='muse-spark-1.3', max_queries=MAX_QUERIES):
+    def __init__(self, client, *, model='muse-spark-1.3', max_queries=MAX_QUERIES,
+                 independent=None):
+        """`independent(refs) -> int` counts independent witnesses among cited refs.
+
+        Supply the EvidenceStore-backed counter (authenticated lineage, physical
+        observer, common causes). The fallback only reads the evidence
+        summaries: refs collapse by physical_observer (else source_id) and by
+        shared origin, which is weaker; it never counts relays separately.
+        """
         if model != 'muse-spark-1.3' or type(max_queries) is not int or not 1 <= max_queries <= MAX_QUERIES:
             raise ValueError('use Standard muse-spark-1.3 and a query budget of 1..4')
+        if independent is not None and not callable(independent):
+            raise ValueError('independent must be callable')
         self.client, self.model, self.max_queries = client, model, max_queries
+        self.independent = independent
         self.rejections = []
         self._plan_calls = {}
 
@@ -160,6 +171,10 @@ class Reasoner:
         if type(now_us) is not int or now_us < 0:
             raise ValueError('invalid reasoner clock')
         planned = {q.query_id: q for q in queries}
+        # Evidence roles come from typed answers, never from model text.
+        supporting = {ref for a in answers if a.result == 'detected' for ref in a.evidence_refs}
+        contradicting = {a.coverage_ref for a in answers
+                         if a.result == 'observed_free' and a.coverage_ref}
         if any(a.query_id not in planned or a.observer_id != planned[a.query_id].observer_id
                or (a.observed_time_us is not None and a.observed_time_us > now_us) for a in answers):
             raise ValueError('answers must match existing queries and available scene time')
@@ -209,14 +224,18 @@ class Reasoner:
                 refs = tuple(dict.fromkeys(accepted))
                 state = row['state'] if refs or row['state'] == 'unverified' else 'unverified'
                 reason = row['reason'] if refs else 'UNVERIFIED: no valid cited evidence.'
-                sources = {visible[ref].get('source_id') for ref in refs}
-                if state in ('corroborated', 'contested') and (None in sources or len(sources) < 2):
-                    # Count independent observers, not messages: a model may not
-                    # upgrade trust beyond what the cited evidence supports.
+                # A model may not upgrade trust beyond what the cited evidence
+                # supports: count independent witnesses, not messages or IDs.
+                support = [ref for ref in refs if ref in supporting]
+                if state == 'corroborated' and self._witnesses(support, visible) < 2:
                     self._reject('judge', 'SINGLE_SOURCE_CORROBORATION', index)
                     state = 'unverified'
-                    reason = 'UNVERIFIED: single source. ' + row['reason']
-                    reason = reason[:1024]
+                    reason = ('UNVERIFIED: fewer than two independent witnesses. ' + row['reason'])[:1024]
+                elif state == 'contested' and not (support and any(ref in contradicting for ref in refs)):
+                    # Contested needs a detection AND range free space against it.
+                    self._reject('judge', 'CONTESTED_WITHOUT_BOTH_ROLES', index)
+                    state = 'unverified'
+                    reason = ('UNVERIFIED: contested needs support and contradiction. ' + row['reason'])[:1024]
                 verdicts.append(Verdict(f'v-{result.call_id}-{now_us}-{index}', row['subject'],
                     state, refs, reason, calls))
             except (ValueError, TypeError, KeyError):
@@ -224,8 +243,42 @@ class Reasoner:
         return verdicts, result
 
 
-def execute(queries, capabilities, observers, *, max_queries=MAX_QUERIES):
-    """Preflight the ENTIRE plan before any observer call; fail closed on bad answers."""
+    def _witnesses(self, refs, visible):
+        if not refs:
+            return 0
+        if self.independent is not None:
+            return int(self.independent(tuple(refs)))
+        parent = {}
+        def find(x):
+            while parent.setdefault(x, x) != x:
+                x = parent[x]
+            return x
+        for ref in refs:
+            summary = visible[ref]
+            body = summary.get('physical_observer') or summary.get('source_id')
+            if body is None:
+                return 0  # unknown provenance never counts
+            nodes = [('body', body)]
+            origin = summary.get('origin_message_id') or summary.get('root_ref')
+            if origin:
+                nodes.append(('origin', origin))
+            for node in nodes[1:]:
+                parent[find(node)] = find(nodes[0])
+            find(nodes[0])
+        return len({find(x) for x in list(parent) if x[0] == 'body'})
+
+
+class ObserverUnavailable(Exception):
+    """An observer could not answer (link down, model call refused or failed)."""
+
+
+def execute(queries, capabilities, observers, *, max_queries=MAX_QUERIES,
+            unavailable=(ObserverUnavailable, OSError, TimeoutError)):
+    """Preflight the ENTIRE plan before any observer call; fail closed on bad answers.
+
+    Only `unavailable` exception types become an `unavailable` answer; any
+    other exception is a bug and propagates instead of being hidden.
+    """
     if type(max_queries) is not int or not 1 <= max_queries <= MAX_QUERIES or len(queries) > max_queries:
         raise ValueError('query budget exceeded')
     if any(not isinstance(q, Query) for q in queries) or any(not isinstance(c, Capability) for c in capabilities):
@@ -245,9 +298,11 @@ def execute(queries, capabilities, observers, *, max_queries=MAX_QUERIES):
     for query in queries:
         try:
             answer = observers[query.observer_id](query)
-            if not isinstance(answer, Answer) or answer.query_id != query.query_id or answer.observer_id != query.observer_id:
-                raise ValueError('observer answer identity mismatch')
-        except Exception:
+        except unavailable:
+            answer = None
+        if (not isinstance(answer, Answer) or answer.query_id != query.query_id
+                or answer.observer_id != query.observer_id):
+            # A missing or mismatched answer fails closed; it is never trusted.
             answer = Answer(query.query_id, query.observer_id, 'unavailable', None, None, ())
         answers.append(answer)
     return answers

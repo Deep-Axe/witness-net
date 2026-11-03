@@ -120,10 +120,24 @@ def load_events(path: Path) -> list[dict]:
 
 
 class S2PipelineTests(unittest.TestCase):
-    def _run(self, path: Path, **kwargs):
+    _cache: dict = {}
+
+    def _run(self, path: Path, *, fresh: bool = False, **kwargs):
+        """Run S2 once per argument set and reuse the log (each run takes seconds).
+
+        `fresh=True` forces a real run (the determinism test must compare two).
+        """
         defaults = dict(seed=0, loss=0.0, delay_us=50_000, jitter_us=0, key_seed=1)
         defaults.update(kwargs)
-        return run_s2(path, **defaults)
+        key = tuple(sorted(defaults.items()))
+        if fresh or key not in self._cache:
+            summary = run_s2(path, **defaults)
+            if not fresh:
+                type(self)._cache[key] = (summary, Path(path).read_bytes())
+            return summary
+        summary, data = self._cache[key]
+        Path(path).write_bytes(data)
+        return dict(summary, events=str(path))
 
     def test_log_has_s2_event_types_and_passes_full_validator(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,8 +201,8 @@ class S2PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             a = Path(tmp) / "a.jsonl"
             b = Path(tmp) / "b.jsonl"
-            self._run(a, key_seed=3)
-            self._run(b, key_seed=3)
+            self._run(a, key_seed=3, fresh=True)
+            self._run(b, key_seed=3, fresh=True)
             self.assertEqual(load_events(a), load_events(b))
 
     def test_free_space_ghost_contradicted_silent_ghost_unverified(self):
