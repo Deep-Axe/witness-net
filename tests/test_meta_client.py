@@ -104,6 +104,54 @@ class MetaClientTests(unittest.TestCase):
             body = json.loads(post.requests[0]["body"])
             self.assertEqual(body["max_output_tokens"], 4000)
 
+    def _sam(self, client, text):
+        return client.respond(model="sam-3.1", instructions="",
+                              input=[{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+                              query_time_us=0, stage="segment")
+
+    def test_concurrent_calls_cannot_overspend(self):
+        import threading
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            def slow(url, headers, body, timeout):
+                _time.sleep(0.05)
+                return _ok("x", images=1)
+            # SAM reserves 3 attempts x $0.0025 = $0.0075; room for exactly two.
+            results = []
+            def worker(i):
+                client = self._client(tmp, slow, budget_usd=0.015)
+                try:
+                    self._sam(client, f"p{i}")
+                    results.append("ok")
+                except BudgetExceeded:
+                    results.append("refused")
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(sorted(results), ["ok", "ok", "refused", "refused"])
+            ledger = self._client(tmp, slow, budget_usd=1.0).logged_cost_usd()
+            self.assertAlmostEqual(ledger, 0.005)  # settled actual cost, no leftovers
+
+    def test_timeouts_keep_their_reservation_4xx_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            post = FakePost([TimeoutError("t")] * 3)
+            client = self._client(tmp, post, budget_usd=0.02)
+            with self.assertRaises(MetaAPIError):
+                self._sam(client, "a")
+            # Possibly billed: still counted, across a fresh client (restart).
+            self.assertAlmostEqual(self._client(tmp, post).logged_cost_usd(), 0.0075)
+            err400 = urllib.error.HTTPError("https://api.meta.ai/v1/responses", 400, "bad",
+                                            hdrs=None, fp=io.BytesIO(b"{}"))
+            client = self._client(tmp, FakePost([err400]), budget_usd=0.02)
+            with self.assertRaises(MetaAPIError):
+                self._sam(client, "b")
+            self.assertAlmostEqual(client.logged_cost_usd(), 0.0075)  # 4xx released
+            # The kept reservation limits further spending.
+            with self.assertRaises(BudgetExceeded):
+                self._sam(self._client(tmp, FakePost([]), budget_usd=0.012), "c")
+
     def test_5xx_retries_4xx_does_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             err500 = urllib.error.HTTPError(

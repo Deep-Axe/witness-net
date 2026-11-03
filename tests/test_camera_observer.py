@@ -159,6 +159,28 @@ class CameraObserverTests(unittest.TestCase):
             self.assertEqual(len(labels), 2)
             self.assertEqual(sorted(observer.labels.values()), ["traffic cone", "trash can"])
 
+    def test_empty_sam_result_still_waits_for_sam(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            post = _FakePost([_ok("", images=1)])
+            client = MetaClient(cache_dir=Path(tmp) / "c", cost_log=Path(tmp) / "cost.jsonl",
+                                post=post, environ={"MODEL_API_KEY": "k"},
+                                clock=iter([0.0, 2.9]).__next__)
+
+            class DummyFrame:
+                cameras = {"cam1": None}
+
+            observer = CameraObserver(
+                "rsu-2", lambda: CameraFrame(_tiny_png(), (32, 32), 1_000_000, DummyFrame(), "cam1"),
+                "cam1", client, lambda *a, **k: None, demo_node_key(1, "rsu-2"),
+                ttl_us=5_000_000, concepts=())
+            cap = Capability("rsu-2", ("camera_rgb",), ("T3",), "open",
+                             ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)))
+            answer, at_us = observer.on_query(
+                Query("q1", "T3", "rsu-2", (3.0, 4.0), 1.0, 1_000_000, "stroller", "x"),
+                cap, 10_000_000)
+            self.assertEqual(at_us, 12_900_000)
+            self.assertNotEqual(answer.result, "detected")
+
     def test_lift_needs_min_points(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

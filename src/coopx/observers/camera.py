@@ -110,11 +110,12 @@ class CameraObserver:
 
     def _sign(self, xyz, cls: ObjectClass, capture_us: int, object_id: int,
               publish_us: int, std=None, dimensions=None,
-              label_id: int | None = None) -> ObservationMessage:
+              label_id: int | None = None,
+              anchor: PositionAnchor = PositionAnchor.SURFACE) -> ObservationMessage:
         sequence = self._next_seq()
         observation = Observation(
             self.observer_id, object_id, sequence, capture_us, cls, xyz,
-            PositionAnchor.SURFACE, dimensions_m=dimensions, confidence=0.8,
+            anchor, dimensions_m=dimensions, confidence=0.8,
             position_std_m=std)
         message_id = f"{self.observer_id}-{sequence:04d}"
         envelope = Envelope(
@@ -127,14 +128,9 @@ class CameraObserver:
                                        label_id=label_id), self.key)
 
     def _lift(self, detection: Detection, frame: CameraFrame):
-        """Pass mask= when the lift accepts it (Agent A's seam); else the box."""
-        args = (detection.box_xyxy, frame.agent_frame, frame.camera_name)
-        if detection.mask is not None:
-            try:
-                return self.lift_fn(*args, mask=detection.mask)
-            except TypeError:
-                pass
-        return self.lift_fn(*args)
+        """Lift with the SAM mask when decoded (contract 12), else the box."""
+        return self.lift_fn(detection.box_xyxy, frame.agent_frame, frame.camera_name,
+                            mask=detection.mask)
 
     def _detect(self, frame: CameraFrame, concept: str, query_time_us: int):
         key = (frame.capture_us, normalize_concept(concept.strip()))
@@ -155,9 +151,12 @@ class CameraObserver:
             if lifted is None:
                 continue
             cls = CLASS_CONCEPTS.get(normalize_concept(concept.strip()), ObjectClass.UNKNOWN)
+            # A ground-ray contact point has no measured body size (contract 8 notes).
+            dimensions = None if getattr(lifted, "method", "lidar") != "lidar" else lifted.extent_m
             message = self._sign(
                 lifted.xyz_site, cls, frame.capture_us, self._next_object_id(),
-                result.availability_time_us, lifted.std_m, lifted.extent_m, label_id)
+                result.availability_time_us, lifted.std_m, dimensions, label_id,
+                anchor=lifted.anchor)
             messages.append(message)
             self.published.append(message)
         return messages, result
@@ -192,8 +191,12 @@ class CameraObserver:
         self._latest = frame
         answered_at = now_us
         if query.tier == "T3" and query.concept:
-            messages, result = self._detect(frame, query.concept.strip(), now_us)
-            if messages:
+            key = (frame.capture_us, normalize_concept(query.concept.strip()))
+            reused = key in self._segmented
+            _messages, result = self._detect(frame, query.concept.strip(), now_us)
+            if not reused:
+                # The answer exists only once SAM has replied, even when it
+                # found nothing ("not_detected" is a result, not an instant).
                 answered_at = max(answered_at, result.availability_time_us)
         answer = self.answer_fn(query, capability, list(self.published), [], answered_at,
                                 labels=dict(self.labels))

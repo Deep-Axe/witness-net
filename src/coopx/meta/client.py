@@ -212,15 +212,74 @@ class MetaClient:
         self._env_path = env_path
 
     def logged_cost_usd(self) -> float:
+        """Spent plus outstanding reservations (possibly-billed calls count)."""
         if not self.cost_log.is_file():
             return 0.0
-        total = 0.0
-        for line in self.cost_log.read_text(encoding="utf-8").splitlines():
+        with self._locked_ledger() as handle:
+            return self._ledger_total(handle)
+
+    # -- Ledger: one append-only JSONL file shared by every client/process. ---
+    # Rows: legacy/settled spend {"cost_usd"}; {"kind":"reserve","rid","amount"};
+    # {"kind":"settle","rid","cost_usd",...}; {"kind":"release","rid"}. A
+    # reservation without settle/release (timeout, 5xx, crash) stays counted.
+
+    def _locked_ledger(self):
+        import contextlib
+        import fcntl
+
+        @contextlib.contextmanager
+        def locked():
+            self.cost_log.parent.mkdir(parents=True, exist_ok=True)
+            with self.cost_log.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                try:
+                    yield handle
+                finally:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+        return locked()
+
+    @staticmethod
+    def _ledger_total(handle) -> float:
+        handle.seek(0)
+        spent, outstanding = 0.0, {}
+        for line in handle.read().splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
-            total += float(row.get("cost_usd") or 0.0)
-        return total
+            kind = row.get("kind")
+            if kind == "reserve":
+                outstanding[row["rid"]] = float(row["amount"])
+            elif kind in ("settle", "release"):
+                outstanding.pop(row.get("rid"), None)
+                spent += float(row.get("cost_usd") or 0.0)
+            else:
+                spent += float(row.get("cost_usd") or 0.0)
+        return spent + sum(outstanding.values())
+
+    @staticmethod
+    def _write_row(handle, row: dict) -> None:
+        handle.seek(0, os.SEEK_END)
+        handle.write(json.dumps(row, allow_nan=False, separators=(",", ":")) + "\n")
+
+    def _reserve(self, product: str, amount: float) -> str:
+        """Atomically check budget (spent + outstanding + amount) and record a reservation."""
+        import uuid
+        with self._locked_ledger() as handle:
+            total = self._ledger_total(handle)
+            if self.budget_usd <= 0 or total + amount > self.budget_usd + 1e-12:
+                raise BudgetExceeded(
+                    f"ledger {total:.6f} USD plus a {amount:.6f} USD reservation for the next "
+                    f"{product} call would exceed budget {self.budget_usd:.4f} USD")
+            rid = uuid.uuid4().hex
+            self._write_row(handle, {"kind": "reserve", "rid": rid, "product": product,
+                                     "amount": round(amount, 8)})
+            return rid
+
+    def _close_reservation(self, rid: str, row: dict) -> None:
+        with self._locked_ledger() as handle:
+            self._write_row(handle, {"rid": rid, **row})
 
     def _cache_path(self, digest: str) -> Path:
         return self.cache_dir / f"{digest}.json"
@@ -239,31 +298,20 @@ class MetaClient:
                        encoding="utf-8")
         os.replace(tmp, path)
 
-    def _append_cost(self, record: dict) -> None:
-        self.cost_log.parent.mkdir(parents=True, exist_ok=True)
-        with self.cost_log.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
-
     @staticmethod
-    def reserve_usd(product: str, *, instructions: str, input) -> float:
-        """Worst-case cost of the next call, reserved before dispatch.
+    def reserve_usd(product: str, *, instructions: str, input, text_format=None) -> float:
+        """Worst-case cost of ONE attempt, reserved before dispatch.
 
-        SAM bills per image. Spark: input tokens bounded by serialized bytes
-        (one token per 2 bytes, conservative; images priced as text bytes) plus
-        the full output cap at the output rate.
+        SAM bills per image. Spark: at most one input token per serialized byte
+        (byte-level tokenizers never emit more tokens than bytes), counting the
+        instructions, input and output schema, plus the full output cap.
         """
         if product == "sam-3.1":
             return SAM_IMAGE_USD
-        size = len(instructions.encode("utf-8")) + len(
-            json.dumps(input, allow_nan=False, sort_keys=True).encode("utf-8"))
-        return (size / 2) * SPARK_IN_USD + SPARK_MAX_OUTPUT_TOKENS * SPARK_OUT_USD
-
-    def _refuse_if_over_budget(self, product: str, reserve: float) -> None:
-        logged = self.logged_cost_usd()
-        if self.budget_usd <= 0 or logged + reserve > self.budget_usd + 1e-12:
-            raise BudgetExceeded(
-                f"logged cost {logged:.6f} USD plus a {reserve:.6f} USD reservation for "
-                f"the next {product} call would exceed budget {self.budget_usd:.4f} USD")
+        size = (len(instructions.encode("utf-8"))
+                + len(json.dumps(input, allow_nan=False, sort_keys=True).encode("utf-8"))
+                + len(json.dumps(text_format, allow_nan=False, sort_keys=True).encode("utf-8")))
+        return size * SPARK_IN_USD + SPARK_MAX_OUTPUT_TOKENS * SPARK_OUT_USD
 
     def _live_call(self, *, model: str, instructions: str, input, text_format,
                    reasoning_effort: str) -> dict:
@@ -356,12 +404,20 @@ class MetaClient:
         if self.offline:
             raise CacheMiss(f"no cached response for {model} ({stage})")
         # Every attempt may be billed (a timed-out request is not proof of no charge).
-        reserve = self.reserve_usd(model, instructions=instructions, input=input) * (1 + MAX_RETRIES)
-        self._refuse_if_over_budget(model, reserve)
+        reserve = self.reserve_usd(model, instructions=instructions, input=input,
+                                   text_format=text_format) * (1 + MAX_RETRIES)
+        rid = self._reserve(model, reserve)
         started = self._clock()
-        payload = self._live_call(
-            model=model, instructions=instructions, input=input,
-            text_format=text_format, reasoning_effort=reasoning_effort)
+        try:
+            payload = self._live_call(
+                model=model, instructions=instructions, input=input,
+                text_format=text_format, reasoning_effort=reasoning_effort)
+        except MetaAPIError as exc:
+            if exc.status is not None and 400 <= exc.status < 500:
+                # Rejected before inference: not billed.
+                self._close_reservation(rid, {"kind": "release", "cost_usd": 0.0})
+            # Timeouts, 5xx and network errors keep the reservation (maybe billed).
+            raise
         latency_ms = max(0.0, (self._clock() - started) * 1000.0)
         text = _extract_text(payload)
         parsed = None
@@ -381,8 +437,8 @@ class MetaClient:
             "images": images, "cost_usd": cost, "product": model,
         }
         self._store_cache(digest, record)
-        self._append_cost({
-            "call_id": call_id, "product": model, "stage": stage,
+        self._close_reservation(rid, {
+            "kind": "settle", "call_id": call_id, "product": model, "stage": stage,
             "cost_usd": cost, "input_tokens": input_tokens,
             "output_tokens": output_tokens, "images": images,
             "latency_ms": latency_ms,

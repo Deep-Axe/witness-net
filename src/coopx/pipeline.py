@@ -144,46 +144,11 @@ def _result_mode(result, fallback: str) -> str:
 def admit_packet(checker, raw: bytes, now_us: int, *, scene_time_us: int | None = None):
     """Live admission, or snapshot admission for Q&A packets (contract 11).
 
-    Prefers `Checker.check(..., scene_time_us=)` when Agent A has landed it.
-    Until then a local stub judges freshness against the asked scene; expiry,
-    signature, duplicate and replay still go through the Checker. Snapshot
-    admissions must never feed the Assessor or coverage map.
+    Snapshot admissions (Checker docstring is the rule) must never feed the
+    Assessor, coverage map or any hazard path: Reasoner evidence only.
     """
-    if scene_time_us is None:
-        result = checker.check(raw, now_us)
-        return result, _result_mode(result, "live")
-    try:
-        result = checker.check(raw, now_us, scene_time_us=scene_time_us)
-        return result, _result_mode(result, "snapshot")
-    except TypeError:
-        pass
-    try:
-        message = decode(raw)
-        envelope = message.envelope
-    except (ValueError, TypeError):
-        return checker.check(raw, now_us), "snapshot"
-    extra = []
-    ttl = getattr(checker, "ttl_us", S3_TTL_US)
-    if abs(envelope.capture_time_us - scene_time_us) > ttl:
-        extra.append("STALE")
-    if now_us > envelope.valid_until_us:
-        extra.append("EXPIRED")
-    if extra:
-        return CheckResult(tuple(extra), "rejected", message), "snapshot"
-    saved_ttl = getattr(checker, "ttl_us", None)
-    saved_future = getattr(checker, "future_tolerance_us", None)
-    try:
-        if saved_ttl is not None:
-            checker.ttl_us = 10 ** 15
-        if saved_future is not None:
-            checker.future_tolerance_us = 10 ** 15
-        result = checker.check(raw, now_us)
-    finally:
-        if saved_ttl is not None:
-            checker.ttl_us = saved_ttl
-        if saved_future is not None:
-            checker.future_tolerance_us = saved_future
-    return result, _result_mode(result, "snapshot")
+    result = checker.check(raw, now_us, scene_time_us=scene_time_us)
+    return result, result.mode
 
 
 def _check_event(delivery: PacketDelivery, result: CheckResult, now_us: int,
@@ -915,6 +880,9 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
             {"source_id": m.envelope.source_id, "class": m.observation.cls.name,
              "xy": [round(m.observation.xyz_m[0], 2), round(m.observation.xyz_m[1], 2)]}
             for m in admitted],
+        # Which offered observers are the same physical body (from trust anchors,
+        # not from model text): rsu-1b is a second camera on rsu-1's unit.
+        "physical_observers": {"rsu-2": "rsu-2", "rsu-1": "rsu-1", "rsu-1b": "rsu-1"},
     }
     def independent(refs):
         # The deterministic witness rule (authenticated lineage, physical

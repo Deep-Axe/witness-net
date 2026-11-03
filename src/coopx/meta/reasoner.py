@@ -134,7 +134,11 @@ class Reasoner:
                 'Prefer T1 for a region snapshot, T2 for targeted verification, '
                 'and T3 for a new concept on an open-vocabulary observer; T0 is subscription/discovery. '
                 'For T0-T2 the concept must be null or one fixed class word: '
-                + ', '.join(sorted(CLASS_CONCEPTS)) + '. Any other noun phrase needs T3.',
+                + ', '.join(sorted(CLASS_CONCEPTS)) + '. Any other noun phrase needs T3. '
+                'Verify: when two or more different physical observers (context.physical_observers, '
+                'if given) have coverage that includes the asked region, query at least two of them '
+                'so independent answers can be cross-checked; one physical observer can never '
+                'corroborate itself.',
             input=_json_input({'question': question, 'capabilities': [asdict(c) for c in capabilities],
                                'context': context, 'max_queries': self.max_queries}),
             query_time_us=now_us, text_format=PLAN_FORMAT, reasoning_effort='minimal', stage='plan')
