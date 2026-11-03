@@ -301,3 +301,18 @@ class CoverageMapTests(unittest.TestCase):
         self.map.add_observation(self.f.observation(xyz=(3.5, 1.5, 1.),
             dimensions=(.1, .1, .1), capture=1_100_000), 1_100_000)
         self.assertEqual(self.map.snapshot(1_100_000)['contested'], [])
+
+
+class GridHelperTests(unittest.TestCase):
+    def test_cell_centre_and_bounds_round_trip(self):
+        from coopx.coverage import GridSpec
+        grid = GridSpec(-10.0, -30.0, 1.0, 60, 60)
+        for cell in ((0, 0), (15, 21), (59, 59)):
+            x0, y0, x1, y1 = grid.cell_bounds(cell)
+            self.assertEqual((x1 - x0, y1 - y0), (1.0, 1.0))
+            self.assertEqual(grid.cell_at(*grid.cell_centre(cell)), cell)
+            self.assertEqual(grid.cell_at(x0, y0), cell)
+
+
+if __name__ == "__main__":
+    unittest.main()

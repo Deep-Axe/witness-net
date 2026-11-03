@@ -51,6 +51,18 @@ class GridSpec:
         return (type(cell) is tuple and len(cell) == 2 and all(type(i) is int for i in cell)
                 and 0 <= cell[0] < self.nx and 0 <= cell[1] < self.ny)
 
+    def cell_centre(self, cell):
+        ix, iy = cell
+        return (self.origin_x + (ix + 0.5) * self.cell_m,
+                self.origin_y + (iy + 0.5) * self.cell_m)
+
+    def cell_bounds(self, cell):
+        """(x0, y0, x1, y1) of a cell; half-open on the upper edges."""
+        ix, iy = cell
+        x0 = self.origin_x + ix * self.cell_m
+        y0 = self.origin_y + iy * self.cell_m
+        return (x0, y0, x0 + self.cell_m, y0 + self.cell_m)
+
     def cell_at(self, x, y):
         if not _finite(x) or not _finite(y):
             raise ValueError("coordinates must be finite")
