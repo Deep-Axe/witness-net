@@ -4,13 +4,18 @@ CX2 has no CX1/CARLA 99-byte cap. Metadata, the 59-byte CX1 object body and
 key reference are signed. SHA-256 refs address complete signed packets.
 Freshness, replay, permissions and spatial relevance belong to the checker.
 """
+from __future__ import annotations
+
 import base64
 from dataclasses import dataclass, replace
 from enum import IntEnum
 import hashlib
 import math
 import struct
-from typing import Callable, Iterable
+from typing import Callable, Iterable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from coopx.coverage import CoverageMessage
 
 from coopx.domain import ObjectClass, Observation, uint
 from coopx.identity import NodeKey, TrustAnchors, TrustClass
@@ -152,7 +157,12 @@ def _pack_text(value):
     raw = value.encode("utf8")
     return struct.pack("<H", len(raw)) + raw
 
-def signing_bytes(message: ObservationMessage) -> bytes:
+def signing_bytes(message: ObservationMessage | CoverageMessage) -> bytes:
+    if not isinstance(message, ObservationMessage):
+        from coopx.coverage import CoverageMessage, coverage_signing_bytes
+        if not isinstance(message, CoverageMessage):
+            raise ValueError("unsupported signed message body")
+        return coverage_signing_bytes(message)
     e, l = message.envelope, message.lineage
     flags = (e.sensor_seq is not None) | ((message.label_id is not None) << 1) | (bool(l.root_ref) << 2)
     out = MAGIC + struct.pack("<BBB", e.protocol_version, MESSAGE_TYPES.index(e.message_type), flags)
@@ -175,18 +185,21 @@ def signing_bytes(message: ObservationMessage) -> bytes:
         raise ValueError("CX2 packet too large")
     return out
 
-def sign(message: ObservationMessage, key: NodeKey) -> ObservationMessage:
+def sign(message: ObservationMessage | CoverageMessage, key: NodeKey):
     signature = key.sign(signing_bytes(message))
     return replace(message, envelope=replace(message.envelope, auth=replace(message.envelope.auth, signature=signature)))
 
-def encode(message: ObservationMessage) -> bytes:
+def encode(message: ObservationMessage | CoverageMessage) -> bytes:
     if len(message.envelope.auth.signature) != 64:
         raise ValueError("signed message required")
     return signing_bytes(message) + message.envelope.auth.signature
 
-def decode(raw: bytes) -> ObservationMessage:
+def decode(raw: bytes) -> ObservationMessage | CoverageMessage:
     if not isinstance(raw, bytes) or not 64 <= len(raw) <= MAX_PACKET_BYTES:
         raise ValueError("invalid CX2 packet size/type")
+    if raw[:4] == b"CX2C":
+        from coopx.coverage import decode_coverage
+        return decode_coverage(raw)
     r = _Reader(raw)
     if r.take(4) != MAGIC:
         raise ValueError("unsupported CX2 magic")
@@ -220,18 +233,24 @@ def decode(raw: bytes) -> ObservationMessage:
         raise ValueError("noncanonical CX2 encoding")
     return message
 
-def verify(message: ObservationMessage, anchors: TrustAnchors) -> bool:
+def verify(message: ObservationMessage | CoverageMessage, anchors: TrustAnchors) -> bool:
     anchor = anchors.get(message.envelope.source_id)
     return bool(anchor and anchor.key_ref == message.envelope.auth.key_ref and NodeKey.verify(
         anchor.public_key, signing_bytes(message), message.envelope.auth.signature))
 
-def evidence_ref(message: ObservationMessage) -> str:
+def evidence_ref(message: ObservationMessage | CoverageMessage) -> str:
     return hashlib.sha256(encode(message)).hexdigest()
 
-def byte_accounting(message: ObservationMessage) -> dict[str, int | str]:
+def byte_accounting(message: ObservationMessage | CoverageMessage) -> dict[str, int | str]:
     """Application-wire bytes; transport reports link framing separately."""
     total = len(encode(message))
     key_ref = len(_pack_text(message.envelope.auth.key_ref))
+    if not isinstance(message, ObservationMessage):
+        from coopx.coverage import coverage_body
+        body_size = len(coverage_body(message.content))
+        return {"message_type": "coverage", "total": total, "signature": 64,
+                "key_ref": key_ref, "coverage_body": body_size,
+                "envelope_and_lineage": total - 64 - key_ref - body_size}
     return {"message_type": message.envelope.message_type, "total": total,
             "signature": 64, "key_ref": key_ref, "object_body": radio_codec.RECORD.size,
             "envelope_and_lineage": total - 64 - key_ref - radio_codec.RECORD.size}
@@ -264,9 +283,9 @@ class EvidenceStore:
     """Content-addressed authenticated packets, with a snapshot of trust anchors."""
     def __init__(self, anchors: TrustAnchors):
         self.anchors = dict(anchors)
-        self._messages: dict[str, ObservationMessage] = {}
+        self._messages: dict[str, ObservationMessage | CoverageMessage] = {}
 
-    def add(self, message: ObservationMessage | bytes) -> str:
+    def add(self, message: ObservationMessage | CoverageMessage | bytes) -> str:
         message = decode(message) if isinstance(message, bytes) else decode(encode(message))
         if not verify(message, self.anchors):
             raise ValueError("unauthenticated evidence")
@@ -274,10 +293,14 @@ class EvidenceStore:
         self._messages[ref] = message
         return ref
 
-    def get(self, ref: str) -> ObservationMessage | None:
+    def get(self, ref: str) -> ObservationMessage | CoverageMessage | None:
         return self._messages.get(ref)
 
-    def authenticated_roots(self, message: ObservationMessage) -> frozenset[str]:
+    def messages(self) -> tuple[ObservationMessage | CoverageMessage, ...]:
+        """Snapshot of authenticated packets; admission/freshness is separate."""
+        return tuple(self._messages.values())
+
+    def authenticated_roots(self, message: ObservationMessage | CoverageMessage) -> frozenset[str]:
         """Fail closed on missing, fabricated, mismatched or cyclic provenance."""
         def resolve(current, visiting):
             if len(visiting) >= 64 or not verify(current, self.anchors):
@@ -304,7 +327,14 @@ class EvidenceStore:
             if e.spatial_frame_id != oe.spatial_frame_id:
                 return None
             if l.derivation == "relayed":
-                if (radio_codec.encode(current.observation), current.kind, current.geometry, current.label_id) != (radio_codec.encode(original.observation), original.kind, original.geometry, original.label_id):
+                if type(current) is not type(original):
+                    return None
+                if isinstance(current, ObservationMessage):
+                    equal = ((radio_codec.encode(current.observation), current.kind, current.geometry, current.label_id)
+                             == (radio_codec.encode(original.observation), original.kind, original.geometry, original.label_id))
+                else:
+                    equal = current.content == original.content
+                if not equal:
                     return None
             roots = resolve(original, visiting)
             if roots is None:
@@ -330,9 +360,11 @@ class EvidenceStore:
         groups: list[set[str]] = []
         roots_to_messages = {}
         for message in messages:
+            if not isinstance(message, ObservationMessage):
+                continue  # A coverage root cannot confirm a semantic class.
             for ref in self.authenticated_roots(message):
                 root = self.get(ref) or (message if ref == evidence_ref(message) else None)
-                if root is not None:
+                if isinstance(root, ObservationMessage):
                     roots_to_messages[ref] = root
         # Each authenticated direct root is a candidate witness. Dependency
         # edges tie a derived measurement to its ancestors; combining independent

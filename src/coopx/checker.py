@@ -3,6 +3,10 @@
 Instances are single-consumer/run state. Rejected packets never mutate replay
 or latest-object state. Source/session changes do not reset replay protection;
 authorized restarts require a new Checker until session rollover is specified.
+
+sensor_seq remains optional for CX2/S1 compatibility: packets without it get
+ID and time checks but cannot advance a sequence window. S2 publishers should
+allocate one increasing per-source sequence across coverage and observations.
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +14,7 @@ import math
 import struct
 
 from coopx.envelope import ObservationMessage, decode, verify
+from coopx.coverage import CoverageMessage, coverage_bounds
 from coopx.identity import TrustAnchors
 
 
@@ -17,7 +22,7 @@ from coopx.identity import TrustAnchors
 class CheckResult:
     codes: tuple[str, ...]
     state: str
-    message: ObservationMessage | None
+    message: ObservationMessage | CoverageMessage | None
 
 
 @dataclass(slots=True)
@@ -67,7 +72,7 @@ class Checker:
             message = decode(raw)
         except (ValueError, TypeError, OverflowError, struct.error):
             return CheckResult(("DECODE_ERROR",), "rejected", None)
-        envelope, observation = message.envelope, message.observation
+        envelope = message.envelope
         anchor = self.anchors.get(envelope.source_id)
         if anchor is None:
             return CheckResult(("UNKNOWN_SOURCE",), "rejected", message)
@@ -94,12 +99,14 @@ class Checker:
                     and sequence <= state.highest - self.replay_window):
                 codes.append("OUTSIDE_REPLAY_WINDOW")
 
-        xyz = observation.xyz_m
-        if (not all(math.isfinite(value) for value in xyz)
-                or (self.roi is not None and any(
-                    xyz[i] < self.roi[i] or xyz[i] > self.roi[i + 3] for i in range(3)))):
+        points = (coverage_bounds(message.content) if isinstance(message, CoverageMessage)
+                  else (message.observation.xyz_m,))
+        if any(not all(math.isfinite(value) for value in xyz)
+               or (self.roi is not None and any(
+                   xyz[i] < self.roi[i] or xyz[i] > self.roi[i + 3] for i in range(3)))
+               for xyz in points):
             codes.append("OUT_OF_BOUNDS")
-        if not anchor.permits(xyz):
+        if any(not anchor.permits(xyz) for xyz in points):
             codes.append("OUTSIDE_PERMITTED_REGION")
         if codes:
             return CheckResult(tuple(codes), "rejected", message)
@@ -113,8 +120,9 @@ class Checker:
             state.sequences.add(sequence)
             state.sequences = {seq for seq in state.sequences
                                if seq > state.highest - self.replay_window}
-        key = observation.key
-        previous = self._latest.get(key)
-        if previous is None or envelope.capture_time_us > previous.envelope.capture_time_us:
-            self._latest[key] = message
+        if isinstance(message, ObservationMessage):
+            key = message.observation.key
+            previous = self._latest.get(key)
+            if previous is None or envelope.capture_time_us > previous.envelope.capture_time_us:
+                self._latest[key] = message
         return CheckResult(("OK",), "accepted", message)

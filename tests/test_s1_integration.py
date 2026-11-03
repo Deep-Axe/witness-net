@@ -7,8 +7,8 @@ import unittest
 from coopx import events
 from coopx.checker import Checker
 from coopx.domain import ObjectClass
-from coopx.envelope import encode
-from coopx.pipeline import S1_TTL_US, _anchors_and_keys, _signed_observation, run_s1
+from coopx.envelope import encode, evidence_ref, decode
+from coopx.pipeline import S1_TTL_US, _anchors_and_keys, _signed_observation, _handle_deliveries, run_s1
 from coopx.transport import PacketTransport
 
 
@@ -53,8 +53,9 @@ class S1IntegrationTests(unittest.TestCase):
     def test_replayed_and_forged_packets_rejected_after_transport(self):
         keys, anchors = _anchors_and_keys()
         checker = Checker(anchors, ttl_us=S1_TTL_US)
+        log = []
         transport = PacketTransport(("pole1", "car1", "ego"), delay_us=100_000,
-                                    jitter_us=80_000, seed=7)
+                                    jitter_us=80_000, seed=7, event_callback=log.append)
         packets = []
         for frame in range(10):
             t = frame * 100_000
@@ -64,20 +65,30 @@ class S1IntegrationTests(unittest.TestCase):
                 velocity=(1.4, 0.0, 0.0)))
             packets.append(raw)
             transport.send("pole1", raw, sim_us=t, message_type="observation")
-        delivered = [d for d in transport.receive_until(2_000_000) if d.receiver == "ego"]
-        self.assertEqual(len(delivered), 10)
-        for d in delivered:
-            self.assertEqual(checker.check(d.packet, d.available_sim_us).codes, ("OK",))
-        # Same bytes again: duplicate. Old bytes much later: also stale/expired.
-        self.assertIn("DUPLICATE", checker.check(packets[5], 1_100_000).codes)
-        late = checker.check(packets[0], 5_000_000).codes
-        self.assertIn("STALE", late)
+        accepted, rejected = _handle_deliveries(transport.receive_until(1_100_000), checker, log)
+        self.assertEqual((accepted, rejected), (10, 0))
+        latest = checker.latest("pole1", 1)
         # Car signs a packet claiming to be the pole: signature fails.
         forged = encode(_signed_observation(
-            "pole1", keys["car1"], object_id=1, frame=11, sim_us=1_100_000,
+            "pole1", keys["car1"], object_id=1, frame=11, sim_us=1_300_000,
             cls=ObjectClass.PEDESTRIAN, xyz=(9.5, 1.0, 0.5), velocity=(1.4, 0.0, 0.0)))
-        self.assertEqual(checker.check(forged, 1_150_000).codes, ("BAD_SIGNATURE",))
-        # Rejections did not disturb state: the newest accepted pole observation stands.
+        for raw, send_us, expected in ((packets[5], 1_100_000, "DUPLICATE"),
+                                        (forged, 1_300_000, "BAD_SIGNATURE"),
+                                        (packets[0], 5_000_000, "STALE")):
+            envelope = decode(raw).envelope
+            transport.send("pole1", raw, sim_us=send_us, message_id=envelope.message_id,
+                           message_type="observation")
+            before = len(log)
+            accepted, rejected = _handle_deliveries(transport.receive_until(send_us + 200_000), checker, log)
+            self.assertEqual((accepted, rejected), (0, 1))
+            checks = [event for event in log[before:] if event["type"] == "check"]
+            self.assertEqual(len(checks), 1)
+            self.assertIn(expected, checks[0]["check_codes"])
+            self.assertEqual(checks[0]["state"], "rejected")
+            self.assertEqual(checks[0]["evidence_ref"], evidence_ref(decode(raw)))
+            self.assertEqual(checker.latest("pole1", 1), latest)
+        for event in log:
+            events.validate(event)
         self.assertEqual(checker.latest("pole1", 1).envelope.sensor_seq, 9)
 
 
