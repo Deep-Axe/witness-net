@@ -1,8 +1,21 @@
 const KEYS = ["schema", "t_replay_us", "type", "source_id", "dest_id", "message_id",
   "message_type", "evidence_ref", "bytes", "check_codes", "state", "detail"];
 const TYPES = ["observation_published", "packet_sent", "packet_dropped", "packet_delivered",
-  "check", "observer_disconnected", "observer_reconnected"];
-const NODES = ["pole1", "car1", "ego"];
+  "check", "observer_disconnected", "observer_reconnected",
+  "coverage_published", "assessment", "map_snapshot"];
+const CHECK_CODES = new Set([
+  "OK", "DECODE_ERROR", "UNKNOWN_SOURCE", "KEY_MISMATCH", "BAD_SIGNATURE",
+  "STALE", "EXPIRED", "FUTURE_TIME", "DUPLICATE", "OUTSIDE_REPLAY_WINDOW",
+  "OUT_OF_BOUNDS", "OUTSIDE_PERMITTED_REGION",
+]);
+const ASSESSMENT_CODES = new Set([
+  "CORROBORATED", "CONTRADICTED_BY_FREE_SPACE",
+  "POSITION_CORROBORATED_CLASS_UNVERIFIED", "UNVERIFIED_SINGLE_SOURCE", "CONTESTED",
+]);
+const ASSESSMENT_STATES = new Set(["corroborated", "contradicted", "unverified", "contested"]);
+const FALLBACK_NODES = ["pole1", "car1", "lidar1", "ghost1", "ghost2", "ego"];
+const DEFAULT_GRID = { origin: [-10, -30], cell_m: 1, nx: 60, ny: 60 };
+const POSES = { lidar1: [0, 0], pole1: [0, -4], ego: [-2, -2], ghost1: [5.5, -8.5], ghost2: [24, 15.2] };
 
 const state = {
   events: [],
@@ -13,9 +26,37 @@ const state = {
   playing: false,
   timer: null,
   selected: -1,
+  mapPick: null,
 };
 
 const $ = (id) => document.getElementById(id);
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function isInt(value) {
+  return typeof value === "number" && Number.isInteger(value) && Number.isFinite(value);
+}
+
+function isHex64(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isCell(value) {
+  return Array.isArray(value) && value.length === 2 && isInt(value[0]) && isInt(value[1]);
+}
+
+function isNonemptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
 function validate(event, index) {
   if (!event || typeof event !== "object") return `line ${index}: not an object`;
@@ -27,6 +68,53 @@ function validate(event, index) {
     if (!KEYS.includes(key)) return `line ${index}: extra ${key}`;
   }
   if (!TYPES.includes(event.type)) return `line ${index}: type ${event.type}`;
+  if (!isInt(event.t_replay_us) || event.t_replay_us < 0) return `line ${index}: t_replay_us`;
+  if (!isNonemptyString(event.source_id)) return `line ${index}: source_id`;
+  for (const name of ["dest_id", "message_id", "message_type"]) {
+    if (event[name] != null && !isNonemptyString(event[name])) return `line ${index}: ${name}`;
+  }
+  if (event.evidence_ref != null && !isHex64(event.evidence_ref)) return `line ${index}: evidence_ref`;
+  if (event.bytes != null && (!isInt(event.bytes) || event.bytes < 0)) return `line ${index}: bytes`;
+  if (!Array.isArray(event.check_codes) || event.check_codes.some((c) => typeof c !== "string")) {
+    return `line ${index}: check_codes`;
+  }
+  if (event.detail == null || typeof event.detail !== "object" || Array.isArray(event.detail)) {
+    return `line ${index}: detail`;
+  }
+  if (event.type === "check") {
+    if (!event.check_codes.length || event.check_codes.some((c) => !CHECK_CODES.has(c))) {
+      return `line ${index}: unknown check code`;
+    }
+    const ok = event.check_codes.length === 1 && event.check_codes[0] === "OK";
+    if (ok && event.state !== "accepted") return `line ${index}: accepted state`;
+    if (!ok && event.state !== "rejected") return `line ${index}: rejected state`;
+  } else if (event.type === "assessment") {
+    if (!ASSESSMENT_STATES.has(event.state)) return `line ${index}: assessment state`;
+    if (!event.check_codes.length || event.check_codes.some((c) => !ASSESSMENT_CODES.has(c))) {
+      return `line ${index}: assessment codes`;
+    }
+    const cells = event.detail.cells;
+    if (!Array.isArray(cells) || cells.some((c) => !isCell(c))) return `line ${index}: assessment cells`;
+  } else if (event.type === "map_snapshot") {
+    if (event.state != null || event.check_codes.length) return `line ${index}: map_snapshot state`;
+    for (const key of ["occupied", "free", "contested"]) {
+      if (!Array.isArray(event.detail[key]) || event.detail[key].some((c) => !isCell(c))) {
+        return `line ${index}: map ${key}`;
+      }
+    }
+    if (!isInt(event.detail.unknown_count) || event.detail.unknown_count < 0) {
+      return `line ${index}: unknown_count`;
+    }
+  } else if (event.type === "coverage_published") {
+    if (event.state != null || event.check_codes.length) return `line ${index}: coverage state`;
+    if (event.message_type !== "coverage") return `line ${index}: coverage message_type`;
+    const free = event.detail.free;
+    const occupied = event.detail.occupied;
+    if (!Array.isArray(free) || free.some((c) => !isCell(c))) return `line ${index}: coverage free`;
+    if (!Array.isArray(occupied) || occupied.some((c) => !isCell(c))) return `line ${index}: coverage occupied`;
+  } else if (event.state != null || event.check_codes.length) {
+    return `line ${index}: unexpected state/codes`;
+  }
   return null;
 }
 
@@ -58,6 +146,15 @@ function until(t) {
   return state.events.filter((e) => e.t_replay_us <= t);
 }
 
+function nodeIds() {
+  const ids = new Set();
+  for (const event of state.events) {
+    if (event.source_id) ids.add(event.source_id);
+    if (event.dest_id) ids.add(event.dest_id);
+  }
+  return ids.size ? [...ids].sort() : FALLBACK_NODES.slice();
+}
+
 function disconnectedAt(t) {
   const off = new Set();
   for (const event of until(t)) {
@@ -82,73 +179,325 @@ function counters(t) {
   return out;
 }
 
+function txOf(event) {
+  return event.detail && event.detail.tx_id;
+}
+
 function inFlight(t) {
-  const delivered = new Set();
-  const dropped = new Set();
+  const done = new Set();
   const sent = [];
   for (const event of until(t)) {
-    const key = `${event.evidence_ref}|${event.dest_id || ""}`;
     if (event.type === "packet_sent") sent.push(event);
-    if (event.type === "packet_delivered") delivered.add(key);
-    if (event.type === "packet_dropped") dropped.add(key);
+    if (event.type === "packet_delivered" || event.type === "packet_dropped") {
+      done.add(`${txOf(event)}|${event.dest_id}`);
+    }
   }
+  const nodes = nodeIds();
   const flights = [];
   for (const event of sent) {
-    for (const dest of NODES) {
+    const tx = txOf(event);
+    for (const dest of nodes) {
       if (dest === event.source_id) continue;
-      const key = `${event.evidence_ref}|${dest}`;
-      if (delivered.has(key) || dropped.has(key)) continue;
+      if (done.has(`${tx}|${dest}`)) continue;
       const later = state.events.find((e) =>
-        e.t_replay_us > t && e.evidence_ref === event.evidence_ref &&
-        ((e.type === "packet_delivered" && e.dest_id === dest) ||
-         (e.type === "packet_dropped" && e.dest_id === dest)));
-      if (later) flights.push({ source: event.source_id, dest, evidence_ref: event.evidence_ref, bytes: event.bytes });
+        e.t_replay_us > t && txOf(e) === tx && e.dest_id === dest &&
+        (e.type === "packet_delivered" || e.type === "packet_dropped"));
+      if (later) {
+        flights.push({
+          source: event.source_id, dest, tx_id: tx,
+          evidence_ref: event.evidence_ref, bytes: event.bytes,
+        });
+      }
     }
   }
   return flights;
 }
 
+function latestOf(type, t) {
+  let found = null;
+  for (const event of until(t)) {
+    if (event.type === type) found = event;
+  }
+  return found;
+}
+
+function latestAssessments(t) {
+  const byRef = new Map();
+  for (const event of until(t)) {
+    if (event.type === "assessment" && event.evidence_ref) byRef.set(event.evidence_ref, event);
+  }
+  return [...byRef.values()];
+}
+
+function gridSpec() {
+  const cov = latestOf("coverage_published", state.t);
+  if (cov && cov.detail && cov.detail.grid) return cov.detail.grid;
+  return DEFAULT_GRID;
+}
+
+function rowClass(event, idx) {
+  const bits = [];
+  if (idx === state.selected) bits.push("sel");
+  if (event.type === "check" && event.state === "rejected") bits.push("rejected");
+  if (event.type === "assessment" && event.state === "contradicted") bits.push("contradicted");
+  if (event.type === "assessment" && event.state === "contested") bits.push("contested");
+  return bits.join(" ");
+}
+
+function renderNodes(off) {
+  const host = $("nodes");
+  clear(host);
+  for (const id of nodeIds()) {
+    const down = off.has(id);
+    const node = el("div", `node ${id}${down ? " off" : ""}`);
+    node.appendChild(el("strong", "", id));
+    node.appendChild(el("span", "", down ? "disconnected" : "connected"));
+    host.appendChild(node);
+  }
+}
+
+function renderPackets(t) {
+  const host = $("packets");
+  clear(host);
+  const nowEvents = state.events.filter((e) => e.t_replay_us === t);
+  const flights = inFlight(t);
+  if (!flights.length && !nowEvents.some((e) => e.type === "packet_delivered" || e.type === "packet_dropped")) {
+    host.appendChild(el("div", "pkt", "No packets at this instant."));
+    return;
+  }
+  for (const flight of flights) {
+    host.appendChild(el("div", "pkt flight",
+      `${flight.source} → ${flight.dest} in flight · ${flight.bytes} B · ${flight.tx_id || ""}`));
+  }
+  for (const event of nowEvents) {
+    if (event.type === "packet_delivered") {
+      host.appendChild(el("div", "pkt done",
+        `${event.source_id} → ${event.dest_id} delivered · ${event.bytes} B`));
+    }
+    if (event.type === "packet_dropped") {
+      const reason = event.detail && event.detail.reason ? event.detail.reason : "?";
+      host.appendChild(el("div", "pkt drop",
+        `${event.source_id} → ${event.dest_id} dropped (${reason})`));
+    }
+  }
+}
+
+function renderTable() {
+  const host = $("rows");
+  clear(host);
+  const rows = state.events.filter((event) => {
+    if (event.t_replay_us > state.t) return false;
+    return state.filter === "all" || event.type === state.filter;
+  });
+  const maxRows = 400;
+  const hidden = Math.max(0, rows.length - maxRows);
+  const visible = hidden ? rows.slice(-maxRows) : rows;
+  if (hidden) {
+    const notice = el("tr", "muted");
+    const cell = el("td", "", `… ${hidden} earlier events (table follows t)`);
+    cell.colSpan = 8;
+    notice.appendChild(cell);
+    host.appendChild(notice);
+  }
+  for (const event of visible) {
+    const idx = state.events.indexOf(event);
+    const tr = el("tr", rowClass(event, idx));
+    tr.dataset.i = String(idx);
+    for (const value of [
+      event.t_replay_us, event.type, event.source_id, event.dest_id ?? "",
+      event.message_id ?? "", event.bytes ?? "",
+      Array.isArray(event.check_codes) ? event.check_codes.join(",") : "",
+      event.state ?? "",
+    ]) {
+      tr.appendChild(el("td", "", value === "" ? "" : String(value)));
+    }
+    host.appendChild(tr);
+  }
+  const wrap = $("table-wrap");
+  const focus = host.querySelector("tr.sel") || host.lastElementChild;
+  if (focus && wrap) focus.scrollIntoView({ block: "nearest" });
+}
+
+function cellKey(cell) {
+  return `${cell[0]},${cell[1]}`;
+}
+
+function claimsForCell(ix, iy) {
+  const claims = [];
+  const key = cellKey([ix, iy]);
+  for (const event of until(state.t)) {
+    if (event.type === "coverage_published") {
+      const free = event.detail.free || [];
+      const occupied = event.detail.occupied || [];
+      if (free.some((c) => cellKey(c) === key)) {
+        claims.push({ kind: "free", event });
+      }
+      if (occupied.some((c) => cellKey(c) === key)) {
+        claims.push({ kind: "occupied", event });
+      }
+    }
+    if (event.type === "assessment") {
+      const cells = event.detail.cells || [];
+      if (cells.some((c) => cellKey(c) === key)) {
+        claims.push({ kind: event.state, event });
+      }
+    }
+  }
+  return claims;
+}
+
+function showEvidence(title, claims) {
+  $("map-info").textContent = title;
+  const host = $("evidence-list");
+  clear(host);
+  if (!claims.length) {
+    host.appendChild(el("li", "", "No linked evidence at this cell."));
+    return;
+  }
+  for (const claim of claims) {
+    const item = el("li");
+    const ref = claim.event.evidence_ref || claim.event.message_id || claim.event.type;
+    const button = el("button", "link", ref);
+    button.type = "button";
+    button.addEventListener("click", () => {
+      const idx = state.events.indexOf(claim.event);
+      if (idx >= 0) select(idx);
+    });
+    item.appendChild(button);
+    item.appendChild(el("span", "evidence-kind", ` ${claim.kind} · ${claim.event.source_id}`));
+    host.appendChild(item);
+  }
+}
+
+function drawHatch(ctx, x, y, w, h, color) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  for (let i = -h; i < w + h; i += 4) {
+    ctx.beginPath();
+    ctx.moveTo(x + i, y);
+    ctx.lineTo(x + i + h, y + h);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function renderMap() {
+  const canvas = $("map");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const grid = gridSpec();
+  const nx = grid.nx || 60;
+  const ny = grid.ny || 60;
+  const snap = latestOf("map_snapshot", state.t);
+  const occupied = new Set((snap && snap.detail.occupied || []).map(cellKey));
+  const free = new Set((snap && snap.detail.free || []).map(cellKey));
+  const contested = new Set((snap && snap.detail.contested || []).map(cellKey));
+  const cw = canvas.width / nx;
+  const ch = canvas.height / ny;
+  ctx.fillStyle = "#121820";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const key = `${ix},${iy}`;
+      const x = ix * cw;
+      const y = canvas.height - (iy + 1) * ch;
+      if (contested.has(key)) {
+        ctx.fillStyle = "#7c4a0a";
+        ctx.fillRect(x, y, cw, ch);
+        drawHatch(ctx, x, y, cw, ch, "#f0b429");
+      } else if (occupied.has(key)) {
+        ctx.fillStyle = "#c23b3b";
+        ctx.fillRect(x, y, cw, ch);
+      } else if (free.has(key)) {
+        ctx.fillStyle = "#2f6f4a";
+        ctx.fillRect(x, y, cw, ch);
+      }
+    }
+  }
+  const origin = grid.origin || DEFAULT_GRID.origin;
+  const cellM = grid.cell_m || 1;
+  function toPx(xy) {
+    const ix = (xy[0] - origin[0]) / cellM;
+    const iy = (xy[1] - origin[1]) / cellM;
+    return [ix * cw, canvas.height - iy * ch];
+  }
+  for (const [id, pose] of Object.entries(POSES)) {
+    if (!nodeIds().includes(id) && id !== "lidar1" && id !== "pole1") continue;
+    const [px, py] = toPx(pose);
+    ctx.fillStyle = id.startsWith("ghost") ? "#fb923c" : (id === "lidar1" ? "#5eead4" : "#6cb6ff");
+    ctx.beginPath();
+    ctx.arc(px, py, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#e7eef6";
+    ctx.font = "10px ui-sans-serif";
+    ctx.fillText(id, px + 5, py - 4);
+  }
+  const colors = {
+    corroborated: "#3dd68c", contradicted: "#ff6b6b",
+    unverified: "#f0b429", contested: "#fb923c",
+  };
+  for (const assessment of latestAssessments(state.t)) {
+    const cells = assessment.detail.cells || [];
+    if (!cells.length) continue;
+    const mx = cells.reduce((s, c) => s + c[0], 0) / cells.length;
+    const my = cells.reduce((s, c) => s + c[1], 0) / cells.length;
+    const [px, py] = [mx * cw + cw / 2, canvas.height - (my * ch + ch / 2)];
+    ctx.strokeStyle = colors[assessment.state] || "#e7eef6";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(px, py, 7, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.mapPick) {
+    const [ix, iy] = state.mapPick;
+    ctx.strokeStyle = "#e7eef6";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(ix * cw + 0.5, canvas.height - (iy + 1) * ch + 0.5, cw - 1, ch - 1);
+  }
+}
+
+function onMapClick(ev) {
+  const canvas = $("map");
+  const grid = gridSpec();
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+  const y = (ev.clientY - rect.top) * (canvas.height / rect.height);
+  const ix = Math.floor(x / (canvas.width / grid.nx));
+  const iy = Math.floor((canvas.height - y) / (canvas.height / grid.ny));
+  if (ix < 0 || iy < 0 || ix >= grid.nx || iy >= grid.ny) return;
+  state.mapPick = [ix, iy];
+  const snap = latestOf("map_snapshot", state.t);
+  const contested = new Set((snap && snap.detail.contested || []).map(cellKey));
+  const label = contested.has(cellKey([ix, iy]))
+    ? `Contested cell [${ix}, ${iy}]`
+    : `Cell [${ix}, ${iy}]`;
+  const claims = claimsForCell(ix, iy);
+  const objects = latestAssessments(state.t).filter((event) =>
+    (event.detail.cells || []).some((c) => c[0] === ix && c[1] === iy));
+  for (const event of objects) {
+    claims.push({ kind: event.state, event });
+  }
+  showEvidence(label, claims);
+  renderMap();
+}
+
 function render() {
   const t = state.t;
-  const off = disconnectedAt(t);
   $("clock").textContent = `t = ${t} µs`;
   $("scrub").value = String(t);
   const counts = counters(t);
   for (const [key, value] of Object.entries(counts)) {
-    const el = document.querySelector(`[data-k="${key}"]`);
-    if (el) el.textContent = String(value);
+    const node = document.querySelector(`[data-k="${key}"]`);
+    if (node) node.textContent = String(value);
   }
-
-  $("nodes").innerHTML = NODES.map((id) => {
-    const down = off.has(id);
-    return `<div class="node ${id}${down ? " off" : ""}"><strong>${id}</strong><span>${down ? "disconnected" : "connected"}</span></div>`;
-  }).join("");
-
-  const nowEvents = state.events.filter((e) => e.t_replay_us === t);
-  const flights = inFlight(t);
-  const bits = [];
-  for (const f of flights) bits.push(`<div class="pkt flight">${f.source} → ${f.dest} in flight · ${f.bytes} B</div>`);
-  for (const event of nowEvents) {
-    if (event.type === "packet_delivered") {
-      bits.push(`<div class="pkt done">${event.source_id} → ${event.dest_id} delivered · ${event.bytes} B</div>`);
-    }
-    if (event.type === "packet_dropped") {
-      bits.push(`<div class="pkt drop">${event.source_id} → ${event.dest_id} dropped (${event.detail.reason})</div>`);
-    }
-  }
-  $("packets").innerHTML = bits.length ? bits.join("") : "<div class='pkt'>No packets at this instant.</div>";
-
-  const rows = state.events.filter((e) => state.filter === "all" || e.type === state.filter);
-  $("rows").innerHTML = rows.map((event, i) => {
-    const idx = state.events.indexOf(event);
-    const cls = idx === state.selected ? "sel" : "";
-    return `<tr class="${cls}" data-i="${idx}">
-      <td>${event.t_replay_us}</td><td>${event.type}</td>
-      <td>${event.source_id}</td><td>${event.dest_id ?? ""}</td>
-      <td>${event.message_id ?? ""}</td><td>${event.bytes ?? ""}</td>
-      <td>${(event.check_codes || []).join(",")}</td><td>${event.state ?? ""}</td>
-    </tr>`;
-  }).join("");
+  renderNodes(disconnectedAt(t));
+  renderPackets(t);
+  renderTable();
+  renderMap();
 }
 
 function select(index) {
@@ -158,6 +507,13 @@ function select(index) {
   if (event) {
     state.t = event.t_replay_us;
     $("scrub").value = String(state.t);
+    if (event.evidence_ref || (event.detail && event.detail.cells)) {
+      const cells = event.detail && event.detail.cells;
+      if (cells && cells[0]) state.mapPick = cells[0];
+      showEvidence(
+        event.type === "assessment" ? `Assessment ${event.state}` : `Event ${event.type}`,
+        [{ kind: event.state || event.type, event }]);
+    }
   }
   render();
 }
@@ -167,14 +523,23 @@ function setLog(text, label) {
   state.events = parsed.events;
   state.errors = parsed.errors;
   state.t = parsed.events.length ? parsed.events[0].t_replay_us : 0;
-  state.tmax = parsed.events.reduce((m, e) => Math.max(m, e.t_replay_us), 0);
+  state.tmax = parsed.events.reduce((max, event) => Math.max(max, event.t_replay_us), 0);
+  state.selected = -1;
+  state.mapPick = null;
   $("scrub").min = String(state.t);
   $("scrub").max = String(state.tmax);
   const status = `${label}: ${parsed.events.length} events, ${parsed.errors} schema errors`;
   $("load-status").textContent = parsed.messages[0] ? `${status}. ${parsed.messages[0]}` : status;
   $("load-status").className = parsed.errors ? "status error" : "status";
   const filters = $("filters");
-  filters.innerHTML = ["all", ...TYPES].map((type) => `<button type="button" data-type="${type}">${type}</button>`).join("");
+  clear(filters);
+  for (const type of ["all", ...TYPES]) {
+    const button = el("button", type === state.filter ? "on" : "", type);
+    button.type = "button";
+    button.dataset.type = type;
+    filters.appendChild(button);
+  }
+  showEvidence("Click a cell or assessed object.", []);
   render();
 }
 
@@ -209,19 +574,22 @@ $("rows").addEventListener("click", (ev) => {
   if (tr) select(Number(tr.dataset.i));
 });
 $("filters").addEventListener("click", (ev) => {
-  const btn = ev.target.closest("button");
-  if (!btn) return;
-  state.filter = btn.dataset.type;
-  for (const el of $("filters").querySelectorAll("button")) el.classList.toggle("on", el === btn);
+  const button = ev.target.closest("button");
+  if (!button) return;
+  state.filter = button.dataset.type;
+  for (const node of $("filters").querySelectorAll("button")) {
+    node.classList.toggle("on", node === button);
+  }
   render();
 });
+$("map").addEventListener("click", onMapClick);
 
 const params = new URLSearchParams(location.search);
 const log = params.get("log");
 if (log) {
-  fetch(log).then((r) => {
-    if (!r.ok) throw new Error(r.status + " " + r.statusText);
-    return r.text();
+  fetch(log).then((response) => {
+    if (!response.ok) throw new Error(response.status + " " + response.statusText);
+    return response.text();
   }).then((text) => setLog(text, log)).catch((err) => {
     $("load-status").textContent = `Could not fetch ${log}: ${err.message}`;
     $("load-status").className = "status error";

@@ -93,17 +93,31 @@ def main() -> None:
     s1.add_argument("--delay-us", type=int, default=100_000)
     s1.add_argument("--jitter-us", type=int, default=50_000)
     s1.add_argument("--disconnect-at-us", type=int, default=None)
+    s1.add_argument("--key-seed", type=int, default=None)
+    s2 = sub.add_parser("s2", help="S2: LiDAR coverage vs camera ghosts")
+    s2.add_argument("--output", type=Path, required=True, help="New JSONL file; existing files are preserved")
+    s2.add_argument("--seed", type=int, default=0)
+    s2.add_argument("--loss", type=float, default=0.0)
+    s2.add_argument("--delay-us", type=int, default=100_000)
+    s2.add_argument("--jitter-us", type=int, default=0)
+    s2.add_argument("--key-seed", type=int, default=0)
     args = parser.parse_args()
     try:
         if args.command == "synthetic":
             result = synthetic(args.output)
         elif args.command == "replay-packets":
             result = replay_packets(args.events)
+        elif args.command == "s2":
+            from coopx.pipeline import run_s2
+            result = run_s2(args.output, seed=args.seed, loss=args.loss,
+                            delay_us=args.delay_us, jitter_us=args.jitter_us,
+                            key_seed=args.key_seed)
         else:
             from coopx.pipeline import run_s1
             result = run_s1(args.output, seed=args.seed, loss=args.loss,
                             delay_us=args.delay_us, jitter_us=args.jitter_us,
-                            disconnect_at_us=args.disconnect_at_us)
+                            disconnect_at_us=args.disconnect_at_us,
+                            key_seed=args.key_seed)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"coopx: {exc}\n")
     print(json.dumps(result, indent=2, allow_nan=False))

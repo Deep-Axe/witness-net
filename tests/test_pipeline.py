@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from coopx.pipeline import PassThroughChecker, run_s1
+from coopx.pipeline import PassThroughChecker, demo_node_key, run_s1
 from coopx.transport import EVENT_KEYS, EVENT_SCHEMA, EVENT_TYPES
 
 
@@ -120,6 +120,69 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.state, "rejected")
         self.assertEqual(result.codes, ("DECODE_ERROR",))
         self.assertIsNone(result.message)
+
+    def test_log_timestamps_never_decrease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s1.jsonl"
+            run_s1(path, seed=1, loss=0.1, delay_us=100_000, jitter_us=150_000,
+                   disconnect_at_us=3_000_000)
+            events = load_events(path)
+            times = [e["t_replay_us"] for e in events]
+            self.assertEqual(times, sorted(times))
+            for prev, cur in zip(events, events[1:]):
+                self.assertLessEqual(prev["t_replay_us"], cur["t_replay_us"])
+
+    def test_check_pairs_by_tx_id_not_tail_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s1.jsonl"
+            run_s1(path, seed=0, loss=0.0, delay_us=100_000, jitter_us=0)
+            events = load_events(path)
+            for i, event in enumerate(events):
+                if event["type"] != "packet_delivered" or event["dest_id"] != "ego":
+                    continue
+                check = events[i + 1]
+                self.assertEqual(check["type"], "check")
+                self.assertEqual(check["evidence_ref"], event["evidence_ref"])
+                self.assertEqual(check["dest_id"], event["dest_id"])
+                self.assertEqual(check["detail"]["tx_id"], event["detail"]["tx_id"])
+
+    def test_due_packets_are_not_dropped_at_disconnect_cutoff(self):
+        """Packets due before 3.000 s survive a cutoff at 3.000 s."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s1.jsonl"
+            summary = run_s1(path, seed=1, loss=0.0, delay_us=100_000, jitter_us=0,
+                             disconnect_at_us=3_000_000)
+            events = load_events(path)
+            delivered = [e for e in events if e["type"] == "packet_delivered"
+                         and e["source_id"] == "car1" and e["dest_id"] == "pole1"]
+            late_due = [e for e in delivered if 2_900_000 <= e["t_replay_us"] <= 3_000_000]
+            self.assertTrue(late_due, "car1→pole1 arrivals just before cutoff must land")
+            dropped_inflight = [
+                e for e in events if e["type"] == "packet_dropped"
+                and e["detail"].get("in_flight")
+                and e["t_replay_us"] == 3_000_000
+            ]
+            for event in dropped_inflight:
+                # Only still-pending (available after cutoff) packets are cut.
+                self.assertTrue(event["detail"].get("tx_id"))
+            self.assertGreater(summary["drops"]["disconnected"], 0)
+
+    def test_key_seed_makes_evidence_refs_reproducible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.jsonl"
+            b = Path(tmp) / "b.jsonl"
+            run_s1(a, seed=0, loss=0.0, delay_us=0, jitter_us=0, key_seed=7)
+            run_s1(b, seed=0, loss=0.0, delay_us=0, jitter_us=0, key_seed=7)
+            self.assertEqual(load_events(a), load_events(b))
+            c = Path(tmp) / "c.jsonl"
+            run_s1(c, seed=0, loss=0.0, delay_us=0, jitter_us=0, key_seed=8)
+            self.assertNotEqual(
+                [e["evidence_ref"] for e in load_events(a) if e["type"] == "observation_published"],
+                [e["evidence_ref"] for e in load_events(c) if e["type"] == "observation_published"])
+
+    def test_demo_node_key_is_deterministic(self):
+        self.assertEqual(demo_node_key(1, "pole1").public_key, demo_node_key(1, "pole1").public_key)
+        self.assertNotEqual(demo_node_key(1, "pole1").public_key, demo_node_key(1, "car1").public_key)
 
 
 if __name__ == "__main__":

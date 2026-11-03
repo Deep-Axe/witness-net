@@ -14,17 +14,10 @@ import heapq
 import random
 from typing import Callable
 
+from coopx.events import EVENT_TYPES, FIELDS, SCHEMA as EVENT_SCHEMA
 from coopx.radio_codec import validate_payload
 
-EVENT_SCHEMA = "coopx.events/1"
-EVENT_TYPES = (
-    "observation_published", "packet_sent", "packet_dropped", "packet_delivered",
-    "check", "observer_disconnected", "observer_reconnected",
-)
-EVENT_KEYS = (
-    "schema", "t_replay_us", "type", "source_id", "dest_id", "message_id",
-    "message_type", "evidence_ref", "bytes", "check_codes", "state", "detail",
-)
+EVENT_KEYS = FIELDS
 MAX_PACKET_BYTES = 65536
 BUDGET_WINDOW_US = 1_000_000
 
@@ -99,8 +92,10 @@ def make_event(*, t_replay_us: int, type: str, source_id: str,
                dest_id: str | None = None, message_id: str | None = None,
                message_type: str | None = None, evidence_ref: str | None = None,
                bytes: int | None = None, check_codes: list[str] | None = None,
-               state: str | None = None, detail: dict | None = None) -> dict:
-    if type not in EVENT_TYPES:
+               state: str | None = None, detail: dict | None = None,
+               extra_types: frozenset[str] | tuple[str, ...] = ()) -> dict:
+    allowed = EVENT_TYPES if not extra_types else (set(EVENT_TYPES) | set(extra_types))
+    if type not in allowed:
         raise ValueError(f"unknown event type {type}")
     return {
         "schema": EVENT_SCHEMA,
@@ -128,6 +123,7 @@ class PacketDelivery:
     message_id: str | None = None
     message_type: str | None = None
     evidence_ref: str | None = None
+    tx_id: str | None = None
 
 
 class PacketTransport:
@@ -136,7 +132,8 @@ class PacketTransport:
     def __init__(self, nodes: tuple[str, ...], *, delay_us: int = 100_000,
                  jitter_us: int = 0, loss_probability: float = 0, seed: int = 0,
                  budget_bytes_per_s: int | None = None,
-                 event_callback: Callable[[dict], None] | None = None):
+                 event_callback: Callable[[dict], None] | None = None,
+                 delivery_callback: Callable[["PacketDelivery"], None] | None = None):
         if len(set(nodes)) != len(nodes) or len(nodes) < 2 or any(not n for n in nodes):
             raise ValueError("provide at least two unique named nodes")
         if type(delay_us) is not int or delay_us < 0:
@@ -153,6 +150,7 @@ class PacketTransport:
         self.loss_probability = loss_probability
         self.budget_bytes_per_s = budget_bytes_per_s
         self.event_callback = event_callback
+        self.delivery_callback = delivery_callback
         self.sent_bytes = 0
         self.received_bytes = 0
         self.drops = {"loss": 0, "disconnected": 0, "budget": 0}
@@ -165,6 +163,7 @@ class PacketTransport:
         self._last_send_us: dict[str, int] = {}
         self._now_us = 0
         self._order = 0
+        self._tx_seq = 0
         self._pending: list = []
         self._disconnected: set[str] = set()
         self._budget_used: dict[tuple[str, str, int], int] = {}
@@ -180,9 +179,12 @@ class PacketTransport:
         packet = bytes(packet)
         size = len(packet)
         ref = packet_hash(packet)
+        self._tx_seq += 1
+        tx_id = f"{source}:{sim_us}:{self._tx_seq}"
         produced: list[dict] = []
         self._last_send_us[source] = sim_us
-        meta = dict(message_id=message_id, message_type=message_type, evidence_ref=ref, bytes=size)
+        meta = dict(message_id=message_id, message_type=message_type, evidence_ref=ref,
+                    bytes=size, tx_id=tx_id)
 
         if source in self._disconnected:
             for receiver in self.nodes:
@@ -195,7 +197,9 @@ class PacketTransport:
         if message_type is not None:
             self.sent_bytes_by_message_type[message_type] += size
         produced.append(self._emit(make_event(
-            t_replay_us=sim_us, type="packet_sent", source_id=source, dest_id=None, **meta)))
+            t_replay_us=sim_us, type="packet_sent", source_id=source, dest_id=None,
+            message_id=message_id, message_type=message_type, evidence_ref=ref,
+            bytes=size, detail={"tx_id": tx_id})))
 
         for receiver in self.nodes:
             if receiver == source:
@@ -217,7 +221,7 @@ class PacketTransport:
             jitter = self._rng.randint(0, self.jitter_us) if self.jitter_us else 0
             delivery = PacketDelivery(
                 source, receiver, sim_us, sim_us + self.delay_us + jitter, packet,
-                message_id, message_type, ref)
+                message_id, message_type, ref, tx_id)
             self._order += 1
             heapq.heappush(self._pending, (delivery.available_sim_us, self._order, delivery))
         return produced
@@ -236,7 +240,10 @@ class PacketTransport:
                 t_replay_us=delivery.available_sim_us, type="packet_delivered",
                 source_id=delivery.source, dest_id=delivery.receiver,
                 message_id=delivery.message_id, message_type=delivery.message_type,
-                evidence_ref=delivery.evidence_ref, bytes=len(delivery.packet)))
+                evidence_ref=delivery.evidence_ref, bytes=len(delivery.packet),
+                detail={"tx_id": delivery.tx_id}))
+            if self.delivery_callback is not None:
+                self.delivery_callback(delivery)
             ready.append(delivery)
         return ready
 
@@ -250,12 +257,13 @@ class PacketTransport:
         kept = []
         for item in self._pending:
             delivery = item[2]
-            if delivery.receiver == node:
+            # Due packets (available_sim_us <= cutoff) stay deliverable.
+            if delivery.receiver == node and delivery.available_sim_us > sim_us:
                 produced.append(self._drop(
                     sim_us, delivery.source, delivery.receiver, "disconnected",
                     message_id=delivery.message_id, message_type=delivery.message_type,
                     evidence_ref=delivery.evidence_ref, bytes=len(delivery.packet),
-                    in_flight=True))
+                    tx_id=delivery.tx_id, in_flight=True))
             else:
                 kept.append(item)
         heapq.heapify(kept)
@@ -275,16 +283,21 @@ class PacketTransport:
             raise ValueError("unknown node")
         if type(sim_us) is not int or sim_us < self._now_us:
             raise ValueError("control time must not go backwards")
+        self._now_us = sim_us
 
     def _drop(self, sim_us: int, source: str, dest: str, reason: str, *,
-              message_id, message_type, evidence_ref, bytes, in_flight: bool = False) -> dict:
+              message_id, message_type, evidence_ref, bytes, tx_id=None,
+              in_flight: bool = False) -> dict:
         self.drops[reason] += 1
         if message_type is not None:
             self.drops_by_message_type[message_type][reason] += 1
+        detail = {"reason": reason, "in_flight": in_flight}
+        if tx_id is not None:
+            detail["tx_id"] = tx_id
         return self._emit(make_event(
             t_replay_us=sim_us, type="packet_dropped", source_id=source, dest_id=dest,
             message_id=message_id, message_type=message_type, evidence_ref=evidence_ref,
-            bytes=bytes, detail={"reason": reason, "in_flight": in_flight}))
+            bytes=bytes, detail=detail))
 
     def _emit(self, event: dict) -> dict:
         self.events.append(event)
