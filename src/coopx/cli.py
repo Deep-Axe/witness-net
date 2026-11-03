@@ -94,6 +94,8 @@ def main() -> None:
     s1.add_argument("--jitter-us", type=int, default=50_000)
     s1.add_argument("--disconnect-at-us", type=int, default=None)
     s1.add_argument("--key-seed", type=int, default=None)
+    s1.add_argument("--overwrite", action="store_true",
+                    help="Replace an existing output file")
     s2 = sub.add_parser("s2", help="S2: LiDAR coverage vs camera ghosts")
     s2.add_argument("--output", type=Path, required=True, help="New JSONL file; existing files are preserved")
     s2.add_argument("--seed", type=int, default=0)
@@ -101,6 +103,16 @@ def main() -> None:
     s2.add_argument("--delay-us", type=int, default=100_000)
     s2.add_argument("--jitter-us", type=int, default=0)
     s2.add_argument("--key-seed", type=int, default=0)
+    s2.add_argument("--overwrite", action="store_true",
+                    help="Replace an existing output file")
+    s3 = sub.add_parser("s3", help="S3: one dataset frame through SAM and the Reasoner")
+    s3.add_argument("--output", type=Path, required=True, help="New JSONL file; existing files are preserved")
+    s3.add_argument("--overwrite", action="store_true",
+                    help="Replace an existing output file")
+    s3.add_argument("--offline", action="store_true",
+                    help="Use the disk cache only; refuse uncached Meta calls")
+    s3.add_argument("--key-seed", type=int, default=0)
+    s3.add_argument("--budget-usd", type=float, default=3.0)
     args = parser.parse_args()
     try:
         if args.command == "synthetic":
@@ -111,13 +123,17 @@ def main() -> None:
             from coopx.pipeline import run_s2
             result = run_s2(args.output, seed=args.seed, loss=args.loss,
                             delay_us=args.delay_us, jitter_us=args.jitter_us,
-                            key_seed=args.key_seed)
+                            key_seed=args.key_seed, overwrite=args.overwrite)
+        elif args.command == "s3":
+            from coopx.pipeline import run_s3
+            result = run_s3(args.output, overwrite=args.overwrite, offline=args.offline,
+                            key_seed=args.key_seed, budget_usd=args.budget_usd)
         else:
             from coopx.pipeline import run_s1
             result = run_s1(args.output, seed=args.seed, loss=args.loss,
                             delay_us=args.delay_us, jitter_us=args.jitter_us,
                             disconnect_at_us=args.disconnect_at_us,
-                            key_seed=args.key_seed)
+                            key_seed=args.key_seed, overwrite=args.overwrite)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"coopx: {exc}\n")
     print(json.dumps(result, indent=2, allow_nan=False))

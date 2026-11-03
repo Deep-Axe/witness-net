@@ -4,7 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from coopx.pipeline import PassThroughChecker, demo_node_key, run_s1
+from unittest.mock import patch
+
+from coopx.pipeline import PassThroughChecker, _write_events, demo_node_key, run_s1
 from coopx.transport import EVENT_KEYS, EVENT_SCHEMA, EVENT_TYPES
 
 
@@ -90,12 +92,43 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(counts["packet_delivered"], 100)
             self.assertGreaterEqual(counts["check"], 100)
 
-    def test_refuses_to_overwrite(self):
+    def test_refuses_to_overwrite_without_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "s1.jsonl"
             path.write_text("existing\n", encoding="utf-8")
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as ctx:
                 run_s1(path, seed=0, loss=0.0, delay_us=0, jitter_us=0)
+            self.assertIn("--overwrite", str(ctx.exception))
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing\n")
+
+    def test_overwrite_replaces_and_crash_keeps_old_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s1.jsonl"
+            path.write_text("existing\n", encoding="utf-8")
+            run_s1(path, seed=0, loss=0.0, delay_us=0, jitter_us=0, overwrite=True)
+            written = path.read_text(encoding="utf-8")
+            self.assertNotEqual(written, "existing\n")
+            self.assertTrue(written.startswith("{"))
+            with self.assertRaises(ValueError):
+                run_s1(path, seed=0, loss=0.0, delay_us=0, jitter_us=0,
+                       overwrite=True, disconnect_at_us=-1)
+            self.assertEqual(path.read_text(encoding="utf-8"), written)
+            leftovers = list(Path(tmp).glob(".s1.jsonl.*.tmp"))
+            self.assertEqual(leftovers, [])
+
+    def test_write_events_unlinks_temp_when_serialize_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.jsonl"
+            path.write_text("keep\n", encoding="utf-8")
+            event = {
+                "type": "observation_published", "t_replay_us": 0,
+                "source_id": "pole1", "dest_id": None,
+            }
+            with patch("coopx.pipeline.json.dumps", side_effect=ValueError("boom")):
+                with self.assertRaises(ValueError):
+                    _write_events(path, [event], overwrite=True)
+            self.assertEqual(path.read_text(encoding="utf-8"), "keep\n")
+            self.assertEqual(list(Path(tmp).glob(".out.jsonl.*.tmp")), [])
 
     def test_disconnect_is_logged_and_summary_matches(self):
         with tempfile.TemporaryDirectory() as tmp:

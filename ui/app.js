@@ -2,7 +2,14 @@ const KEYS = ["schema", "t_replay_us", "type", "source_id", "dest_id", "message_
   "message_type", "evidence_ref", "bytes", "check_codes", "state", "detail"];
 const TYPES = ["observation_published", "packet_sent", "packet_dropped", "packet_delivered",
   "check", "observer_disconnected", "observer_reconnected",
-  "coverage_published", "assessment", "map_snapshot"];
+  "coverage_published", "assessment", "map_snapshot",
+  "query", "answer", "verdict", "model_call"];
+const QUERY_TIERS = new Set(["T0", "T1", "T2", "T3"]);
+const ANSWER_RESULTS = new Set(["detected", "not_detected", "observed_free", "not_covered",
+  "unsupported", "unavailable"]);
+const VERDICT_STATES = new Set(["corroborated", "contradicted", "unverified", "contested"]);
+const MODEL_PRODUCTS = new Set(["muse-spark-1.3", "sam-3.1", "muse-voice-transcribe-1.0"]);
+const MODEL_STAGES = new Set(["plan", "judge", "verify", "segment", "transcribe"]);
 const CHECK_CODES = new Set([
   "OK", "DECODE_ERROR", "UNKNOWN_SOURCE", "KEY_MISMATCH", "BAD_SIGNATURE",
   "STALE", "EXPIRED", "FUTURE_TIME", "DUPLICATE", "OUTSIDE_REPLAY_WINDOW",
@@ -13,10 +20,13 @@ const ASSESSMENT_CODES = new Set([
   "POSITION_CORROBORATED_CLASS_UNVERIFIED", "UNVERIFIED_SINGLE_SOURCE", "CONTESTED",
 ]);
 const ASSESSMENT_STATES = new Set(["corroborated", "contradicted", "unverified", "contested"]);
-const FALLBACK_NODES = ["pole1", "car1", "lidar1", "ghost1", "ghost2", "ego"];
+const FALLBACK_NODES = ["pole1", "pole2", "pole3", "car1", "lidar1", "ghost1", "ghost2", "ego"];
 const ASSESSMENT_TTL_US = 1_000_000;
 const DEFAULT_GRID = { origin: [-10, -30], cell_m: 1, nx: 60, ny: 60 };
-const POSES = { lidar1: [0, 0], pole1: [0, -4], ego: [-2, -2], ghost1: [5.5, -8.5], ghost2: [24, 15.2] };
+const POSES = {
+  lidar1: [0, 0], pole1: [0, -4], pole2: [-2, -8], pole3: [2, -8],
+  ego: [-2, -2], ghost1: [5.5, -8.5], ghost2: [24, 15.2],
+};
 
 const state = {
   events: [],
@@ -113,6 +123,30 @@ function validate(event, index) {
     const occupied = event.detail.occupied;
     if (!Array.isArray(free) || free.some((c) => !isCell(c))) return `line ${index}: coverage free`;
     if (!Array.isArray(occupied) || occupied.some((c) => !isCell(c))) return `line ${index}: coverage occupied`;
+  } else if (event.type === "query") {
+    if (event.state != null || event.check_codes.length) return `line ${index}: query state`;
+    if (event.message_type !== "query" || !event.dest_id || !event.message_id) return `line ${index}: query id`;
+    if (!QUERY_TIERS.has(event.detail.tier)) return `line ${index}: query tier`;
+    const region = event.detail.region;
+    if (!region || !Array.isArray(region.center) || region.center.length !== 2) return `line ${index}: query region`;
+  } else if (event.type === "answer") {
+    if (!ANSWER_RESULTS.has(event.state) || event.check_codes.length) return `line ${index}: answer state`;
+    if (event.message_type !== "answer" || !event.dest_id || !event.message_id) return `line ${index}: answer id`;
+    if (!Array.isArray(event.detail.evidence_refs)) return `line ${index}: answer refs`;
+  } else if (event.type === "verdict") {
+    if (!VERDICT_STATES.has(event.state) || event.check_codes.length) return `line ${index}: verdict state`;
+    if (event.message_type !== "verdict" || !event.message_id) return `line ${index}: verdict id`;
+    if (!isNonemptyString(event.detail.subject) || !Array.isArray(event.detail.evidence_refs)) {
+      return `line ${index}: verdict detail`;
+    }
+  } else if (event.type === "model_call") {
+    if (event.state != null || event.check_codes.length) return `line ${index}: model_call state`;
+    if (!event.message_id) return `line ${index}: model_call id`;
+    const d = event.detail;
+    if (!MODEL_PRODUCTS.has(d.product) || !MODEL_STAGES.has(d.stage)) return `line ${index}: model product`;
+    if (typeof d.cache_hit !== "boolean" || event.t_replay_us !== d.availability_time_us) {
+      return `line ${index}: model_call time honesty`;
+    }
   } else if (event.state != null || event.check_codes.length) {
     return `line ${index}: unexpected state/codes`;
   }
@@ -504,6 +538,65 @@ function onMapClick(ev) {
   renderMap();
 }
 
+function jumpToRef(ref) {
+  const idx = state.events.findIndex((event) =>
+    event.evidence_ref === ref || event.message_id === ref);
+  if (idx >= 0) select(idx);
+}
+
+function renderReasoner() {
+  const host = $("reasoner");
+  if (!host) return;
+  clear(host);
+  const evs = until(state.t);
+  const question = evs.find((e) => e.type === "query");
+  host.appendChild(el("h3", "", "Question"));
+  host.appendChild(el("p", "", question
+    ? (question.detail.reason || question.detail.concept || "region question")
+    : "No query yet."));
+  host.appendChild(el("h3", "", "Plan"));
+  const queries = evs.filter((e) => e.type === "query");
+  if (!queries.length) host.appendChild(el("p", "muted", "No planned queries."));
+  for (const event of queries) {
+    const line = `${event.detail.tier} → ${event.dest_id} · ${event.detail.concept || "—"} · ${event.detail.reason || ""}`;
+    host.appendChild(el("p", "", line));
+  }
+  host.appendChild(el("h3", "", "Answers"));
+  const answers = evs.filter((e) => e.type === "answer");
+  if (!answers.length) host.appendChild(el("p", "muted", "No answers yet."));
+  for (const event of answers) {
+    const row = el("p");
+    row.appendChild(el("span", "", `${event.source_id}: ${event.state} `));
+    for (const ref of event.detail.evidence_refs || []) {
+      const button = el("button", "link", ref.slice(0, 8));
+      button.type = "button";
+      button.addEventListener("click", () => jumpToRef(ref));
+      row.appendChild(button);
+    }
+    host.appendChild(row);
+  }
+  host.appendChild(el("h3", "", "Verdict"));
+  const verdicts = evs.filter((e) => e.type === "verdict");
+  if (!verdicts.length) host.appendChild(el("p", "muted", "No verdict yet."));
+  for (const event of verdicts) {
+    host.appendChild(el("p", "", `${event.state} · ${event.detail.reason || ""}`));
+    for (const ref of event.detail.evidence_refs || []) {
+      const button = el("button", "link", ref.slice(0, 12));
+      button.type = "button";
+      button.addEventListener("click", () => jumpToRef(ref));
+      host.appendChild(button);
+    }
+  }
+  host.appendChild(el("h3", "", "Model calls"));
+  const calls = evs.filter((e) => e.type === "model_call");
+  if (!calls.length) host.appendChild(el("p", "muted", "No model calls yet."));
+  for (const event of calls) {
+    const d = event.detail;
+    const line = `${d.product} ${d.stage} · ${d.latency_ms} ms · cache ${d.cache_hit} · $${d.cost_usd}`;
+    host.appendChild(el("p", "", line));
+  }
+}
+
 function render() {
   const t = state.t;
   $("clock").textContent = `t = ${t} µs`;
@@ -517,6 +610,7 @@ function render() {
   renderPackets(t);
   renderTable();
   renderMap();
+  renderReasoner();
 }
 
 function select(index) {
@@ -559,6 +653,13 @@ function setLog(text, label) {
     filters.appendChild(button);
   }
   showEvidence("Click a cell or assessed object.", []);
+  const img = $("s3-overlay");
+  if (img) {
+    img.hidden = true;
+    img.onload = () => { img.hidden = false; };
+    img.onerror = () => { img.hidden = true; };
+    img.src = "/data/s3/overlay.png";
+  }
   render();
 }
 

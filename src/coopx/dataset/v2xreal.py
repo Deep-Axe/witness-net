@@ -143,6 +143,87 @@ def project_camera(points_camera, intrinsic, *, near_m: float = 0.1):
     return uv, depth, valid
 
 
+def camera_image_size(camera: Camera) -> tuple[int, int]:
+    with Image.open(camera.image_path) as image:
+        return image.size
+
+
+def count_lidar_in_box(frame: AgentFrame, box: GroundTruthBox) -> int:
+    points = transform_points(frame.lidar()[:, :3], frame.lidar_to_site)
+    inverse = np.linalg.inv(pose_to_site((*box.location, *box.angle)))
+    local = transform_points(points, inverse)
+    inside = np.all(np.abs(local - np.asarray(box.center)) <= np.asarray(box.extent), axis=1)
+    return int(inside.sum())
+
+
+def box_fully_in_camera(frame: AgentFrame, box: GroundTruthBox, camera_name: str) -> bool:
+    camera = frame.cameras[camera_name]
+    width, height = camera_image_size(camera)
+    uv, _depth, valid = project_camera(frame.to_camera(box.corners_site(), camera_name),
+                                       camera.intrinsic)
+    return bool(valid.all() and np.all((uv[:, 0] >= 0) & (uv[:, 0] < width)
+                                       & (uv[:, 1] >= 0) & (uv[:, 1] < height)))
+
+
+def point_in_polygon(point: tuple[float, float], polygon: tuple[tuple[float, float], ...]) -> bool:
+    """Inclusive ray-crossing test for a simple polygon."""
+    if len(polygon) < 3:
+        return False
+    x, y = point
+    inside = False
+    x0, y0 = polygon[-1]
+    for x1, y1 in polygon:
+        if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 0.0) + x0):
+            inside = not inside
+        if abs((x1 - x0) * (y - y0) - (x - x0) * (y1 - y0)) <= 1e-9:
+            lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+            lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+            if lo_x - 1e-9 <= x <= hi_x + 1e-9 and lo_y - 1e-9 <= y <= hi_y + 1e-9:
+                return True
+        x0, y0 = x1, y1
+    return inside
+
+
+def camera_footprint_xy(frame: AgentFrame, camera_name: str, *,
+                        max_range_m: float = 40.0,
+                        ground_z: float | None = None) -> tuple[tuple[float, float], ...]:
+    """Ground-plane footprint of the camera frustum, clipped at max_range_m."""
+    camera = frame.cameras[camera_name]
+    width, height = camera_image_size(camera)
+    cam_to_site = frame.camera_to_site(camera_name)
+    origin = cam_to_site[:3, 3]
+    plane_z = float(frame.lidar_to_site[2, 3]) if ground_z is None else float(ground_z)
+    k_inv = np.linalg.inv(camera.intrinsic)
+    pixels = ((0.0, 0.0), (width, 0.0), (width, height), (0.0, height))
+    corners = []
+    for u, v in pixels:
+        ray_cam = k_inv @ np.array([u, v, 1.0])
+        if ray_cam[2] <= 1e-9:
+            direction = cam_to_site[:3, :3] @ (ray_cam / (np.linalg.norm(ray_cam) or 1.0))
+            point = origin + direction * max_range_m
+            corners.append((float(point[0]), float(point[1])))
+            continue
+        # Optical (right, down, forward) ray to site.
+        direction = cam_to_site[:3, :3] @ ray_cam
+        if abs(direction[2]) < 1e-9:
+            unit = direction / (np.linalg.norm(direction) or 1.0)
+            point = origin + unit * max_range_m
+        else:
+            t = (plane_z - origin[2]) / direction[2]
+            point = origin + direction * t
+            if t <= 0:
+                unit = direction / (np.linalg.norm(direction) or 1.0)
+                point = origin + unit * max_range_m
+        offset = point[:2] - origin[:2]
+        dist = float(np.linalg.norm(offset))
+        if dist > max_range_m:
+            point = np.array([origin[0], origin[1], plane_z]) 
+            if dist > 0:
+                point[:2] = origin[:2] + offset * (max_range_m / dist)
+        corners.append((float(point[0]), float(point[1])))
+    return tuple(corners)
+
+
 class V2XReal:
     def __init__(self, root: str | Path, *, nominal_hz: float = 10):
         self.root = Path(root)

@@ -9,8 +9,8 @@
 <body>
   <header class="top">
     <div>
-      <h1>CoopX S2</h1>
-      <p class="tag">Signed observation → coverage → checker → assessment → map</p>
+      <h1>CoopX S3</h1>
+      <p class="tag">Signed observation → checker → SAM / Reasoner → verdict</p>
     </div>
     <label class="file">
       Load JSONL
@@ -86,9 +86,12 @@
         <p class="hint">Supporting and contradicting refs for the selected cell or object.</p>
         <ul id="evidence-list" class="evidence-list"></ul>
       </section>
-      <section class="panel placeholder" data-slot="muse">
-        <h2>Muse call log</h2>
-        <p>Placeholder — latency, tokens, cost. Not part of S2.</p>
+      <section class="panel reasoner-panel" data-slot="muse">
+        <h2>Reasoner</h2>
+        <div id="reasoner">
+          <p class="muted">Load an S3 log to see the plan, answers and verdict.</p>
+        </div>
+        <img id="s3-overlay" alt="SAM overlay" hidden>
       </section>
     </div>
   </main>

@@ -1,8 +1,7 @@
 import unittest
 
+from coopx.coverage import CoverageContent, GridSpec
 from coopx.observers.lidar_synth import (
-    CoverageContent,
-    GridSpec,
     LidarObserver,
     MovingBody,
     Rect,
@@ -27,9 +26,9 @@ class LidarSynthTests(unittest.TestCase):
         self.assertFalse(coverage.free & coverage.occupied)
         self.assertEqual(coverage.modality, "lidar")
 
-        before = spec.cell_of(9.0, 0.0)
-        wall = spec.cell_of(10.2, 0.0)
-        behind = spec.cell_of(14.0, 0.0)
+        before = spec.cell_at(9.0, 0.0)
+        wall = spec.cell_at(10.2, 0.0)
+        behind = spec.cell_at(14.0, 0.0)
         self.assertIn(before, coverage.free)
         self.assertNotIn(before, coverage.occupied)
         self.assertIn(wall, coverage.occupied)
@@ -43,10 +42,10 @@ class LidarSynthTests(unittest.TestCase):
         world = SynthWorld((truck,), (hidden,))
         lidar = LidarObserver(S2_GRID, pose=(0.0, 0.0), n_beams=720, range_m=40.0, seed=0)
         coverage = lidar.scan(world, t_us=0)
-        hidden_cell = S2_GRID.cell_of(24.0, 15.2)
+        hidden_cell = S2_GRID.cell_at(24.0, 15.2)
         self.assertNotIn(hidden_cell, coverage.observed)
         self.assertNotIn(hidden_cell, coverage.occupied)
-        truck_cell = S2_GRID.cell_of(12.2, 8.2)
+        truck_cell = S2_GRID.cell_at(12.2, 8.2)
         self.assertIn(truck_cell, coverage.occupied)
 
     def test_clusters_match_visible_objects(self):
@@ -94,6 +93,15 @@ class LidarSynthTests(unittest.TestCase):
         b = LidarObserver(S2_GRID, seed=4).scan(world, t_us=0)
         self.assertEqual(a.free, b.free)
         self.assertEqual(a.occupied, b.occupied)
+
+    def test_scan_window_ends_at_capture_time(self):
+        lidar = LidarObserver(S2_GRID, seed=0)
+        mid = lidar.scan(wall_world(), t_us=250_000)
+        self.assertEqual(mid.window_us, (150_000, 250_000))
+        self.assertIsInstance(mid, CoverageContent)
+        self.assertIsInstance(mid.spec, GridSpec)
+        first = lidar.scan(wall_world(), t_us=0)
+        self.assertEqual(first.window_us, (0, 0))
 
 
 if __name__ == "__main__":
