@@ -831,7 +831,9 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
 
     observer_rsu2 = make_observer("rsu-2", rsu, pick.camera_name)
     observer_rsu1 = make_observer("rsu-1", other, covering_cam)
-    cameras = {"rsu-2": observer_rsu2, "rsu-1": observer_rsu1}
+    ego_cam = "cam1" if "cam1" in ego.cameras else sorted(ego.cameras)[0]
+    observer_ego = make_observer("ego", ego, ego_cam)
+    cameras = {"rsu-2": observer_rsu2, "rsu-1": observer_rsu1, "ego": observer_ego}
     published_refs: dict[str, ObservationMessage] = {}
 
     def publish_message(message, *, scene_time_us: int | None = None) -> None:
@@ -846,16 +848,17 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
             message_type="observation", evidence_ref=ref, bytes=len(raw),
             detail={"xyz": list(message.observation.xyz_m),
                     "cls": message.observation.cls.name,
-                    "sensor_seq": message.envelope.sensor_seq}))
+                    "sensor_seq": message.envelope.sensor_seq,
+                    "local": message.envelope.source_id == "ego"}))
         transport.send(message.envelope.source_id, raw,
                        sim_us=message.envelope.generation_time_us,
                        message_id=message.envelope.message_id, message_type="observation")
 
-    # Fast path: both RSUs SAM -> lift -> signed observations -> live checker.
+    # Fast path: both RSUs and the ego's own camera. Ego detections are local.
     capture_us = rsu.nominal_time_us
     publish_us = capture_us
     last_avail = capture_us
-    for obs in (observer_rsu2, observer_rsu1):
+    for obs in (observer_rsu2, observer_rsu1, observer_ego):
         for message in obs.observe():
             publish_message(message)
             publish_us = max(publish_us, message.envelope.generation_time_us)
@@ -931,6 +934,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     })
     events.extend(observer_rsu2.drain_events())
     events.extend(observer_rsu1.drain_events())
+    events.extend(observer_ego.drain_events())
     answers_us = plan_avail
     for answer in raw_answers:
         answers_us = max(answers_us, answer_times.get(answer.query_id, plan_avail) + delay_us)
@@ -1011,6 +1015,8 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         "reasoner_rejections": list(reasoner.rejections),
         "rsu2_published": len(observer_rsu2.published),
         "rsu1_published": len(observer_rsu1.published),
+        "ego_published": len(observer_ego.published),
+        "ego_camera": ego_cam,
         "rsu1_camera": covering_cam,
         "rsu1b_camera": gap_cam,
         "snapshot_accepted": sum(
