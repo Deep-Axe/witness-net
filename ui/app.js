@@ -14,6 +14,7 @@ const ASSESSMENT_CODES = new Set([
 ]);
 const ASSESSMENT_STATES = new Set(["corroborated", "contradicted", "unverified", "contested"]);
 const FALLBACK_NODES = ["pole1", "car1", "lidar1", "ghost1", "ghost2", "ego"];
+const ASSESSMENT_TTL_US = 1_000_000;
 const DEFAULT_GRID = { origin: [-10, -30], cell_m: 1, nx: 60, ny: 60 };
 const POSES = { lidar1: [0, 0], pole1: [0, -4], ego: [-2, -2], ghost1: [5.5, -8.5], ghost2: [24, 15.2] };
 
@@ -224,8 +225,9 @@ function latestOf(type, t) {
 function latestAssessments(t) {
   const byRef = new Map();
   for (const event of until(t)) {
-    // Latest judgement per source and footprint; older frames are superseded.
-    if (event.type === "assessment") {
+    // Latest judgement per source and footprint, within the map TTL (1 s);
+    // older judgements expire like the claims they were about.
+    if (event.type === "assessment" && event.t_replay_us > t - ASSESSMENT_TTL_US) {
       byRef.set(`${event.source_id}|${JSON.stringify(event.detail.cells || [])}`, event);
     }
   }
