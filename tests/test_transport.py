@@ -1,8 +1,9 @@
 import unittest
 
+from coopx.events import EVENT_TYPES as CANONICAL_TYPES, FIELDS, SCHEMA
 from coopx.radio_codec import encode
 from coopx.domain import ObjectClass, Observation
-from coopx.transport import PacketTransport, ReferenceTransport, EVENT_KEYS, EVENT_SCHEMA
+from coopx.transport import EVENT_TYPES, PacketTransport, ReferenceTransport, EVENT_KEYS, EVENT_SCHEMA
 
 
 def _ascii_payload():
@@ -111,6 +112,63 @@ class PacketTransportTests(unittest.TestCase):
         for event in bus.events:
             self.assertEqual(set(event), set(EVENT_KEYS))
             self.assertEqual(event["schema"], EVENT_SCHEMA)
+
+    def test_schema_is_imported_from_events(self):
+        self.assertIs(EVENT_TYPES, CANONICAL_TYPES)
+        self.assertEqual(tuple(EVENT_KEYS), FIELDS)
+        self.assertEqual(EVENT_SCHEMA, SCHEMA)
+
+    def test_due_delivery_survives_later_disconnect(self):
+        """Peer review: send at 0 delay 100; disconnect at 500; arrival at 100 is due."""
+        bus = PacketTransport(("a", "b"), delay_us=100, jitter_us=0, seed=0)
+        bus.send("a", b"\x08" * 8, sim_us=0, message_id="due")
+        dropped = bus.disconnect("b", sim_us=500)
+        self.assertEqual(bus.drops["disconnected"], 0)
+        self.assertFalse(any(e["type"] == "packet_dropped" for e in dropped))
+        got = bus.receive_until(500)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].available_sim_us, 100)
+        self.assertEqual(got[0].receiver, "b")
+
+    def test_future_inflight_is_dropped_at_disconnect(self):
+        bus = PacketTransport(("a", "b"), delay_us=1_000, jitter_us=0, seed=0)
+        bus.send("a", b"\x09" * 8, sim_us=0, message_id="late")
+        bus.disconnect("b", sim_us=500)
+        self.assertEqual(bus.drops["disconnected"], 1)
+        self.assertEqual(bus.receive_until(2_000), [])
+
+    def test_nonmonotonic_control_is_rejected(self):
+        bus = PacketTransport(("a", "b"), delay_us=0, jitter_us=0, seed=0)
+        bus.disconnect("b", sim_us=500)
+        with self.assertRaises(ValueError):
+            bus.reconnect("b", sim_us=400)
+
+    def test_each_send_has_unique_tx_id(self):
+        packet = b"\x0a" * 8
+        bus = PacketTransport(("a", "b"), delay_us=50, jitter_us=0, seed=0)
+        bus.send("a", packet, sim_us=0)
+        bus.send("a", packet, sim_us=10)
+        sent = [e for e in bus.events if e["type"] == "packet_sent"]
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]["evidence_ref"], sent[1]["evidence_ref"])
+        tx = [e["detail"]["tx_id"] for e in sent]
+        self.assertEqual(len(set(tx)), 2)
+        got = bus.receive_until(100)
+        self.assertEqual(len(got), 2)
+        self.assertEqual({d.tx_id for d in got}, set(tx))
+        delivered = [e for e in bus.events if e["type"] == "packet_delivered"]
+        self.assertEqual({e["detail"]["tx_id"] for e in delivered}, set(tx))
+
+    def test_delivery_callback_pairs_each_delivery(self):
+        seen = []
+        bus = PacketTransport(
+            ("a", "b", "c"), delay_us=0, jitter_us=0, seed=0,
+            delivery_callback=seen.append)
+        bus.send("a", b"\x0b" * 4, sim_us=0)
+        got = bus.receive_until(0)
+        self.assertEqual(len(got), 2)
+        self.assertEqual([d.receiver for d in seen], [d.receiver for d in got])
+        self.assertEqual([d.tx_id for d in seen], [d.tx_id for d in got])
 
 
 if __name__ == "__main__":

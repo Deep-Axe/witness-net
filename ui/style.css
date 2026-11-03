@@ -11,6 +11,12 @@
   --pole: #6cb6ff;
   --car: #3dd68c;
   --ego: #d4a5ff;
+  --lidar: #5eead4;
+  --ghost: #fb923c;
+  --occupied: #c23b3b;
+  --free: #2f6f4a;
+  --unknown: #121820;
+  --contested: #d97706;
 }
 
 * { box-sizing: border-box; }
@@ -20,15 +26,17 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
 .top { display: flex; gap: 16px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .top h1 { margin: 0; font-size: 18px; }
 .tag { margin: 2px 0 0; color: var(--muted); }
-.file { border: 1px solid var(--line); padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+.file { border: 1px solid var(--line); padding: 6px 10px; border-radius: 6px; cursor: pointer; flex: 0 0 auto; }
 .file input { display: none; }
-.status { color: var(--muted); flex: 1; }
+.status { color: var(--muted); flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; white-space: normal; }
 .status.error { color: var(--bad); }
 
-.counters { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; padding: 10px 16px; }
-.counters div { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.counters { display: grid; grid-template-columns: repeat(8, minmax(7rem, 1fr)); gap: 8px; padding: 10px 16px; }
+.counters div { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; }
 .counters span { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
-.counters label { color: var(--muted); font-size: 11px; }
+.counters label { color: var(--muted); font-size: 11px; display: block; overflow-wrap: anywhere; }
+.schema-chip { border-color: var(--warn); }
+.schema-chip span { color: var(--warn); }
 
 .timeline { display: flex; gap: 12px; align-items: center; padding: 8px 16px; }
 .timeline input { flex: 1; }
@@ -53,6 +61,8 @@ button { background: var(--accent); color: #041018; border: 0; border-radius: 6p
 .node.pole1 { border-left: 4px solid var(--pole); }
 .node.car1 { border-left: 4px solid var(--car); }
 .node.ego { border-left: 4px solid var(--ego); }
+.node.lidar1 { border-left: 4px solid var(--lidar); }
+.node.ghost1, .node.ghost2 { border-left: 4px solid var(--ghost); }
 .node.off { opacity: 0.45; }
 .packets { font-family: ui-monospace, monospace; font-size: 12px; }
 .pkt { padding: 4px 0; border-bottom: 1px solid var(--line); }
@@ -69,10 +79,30 @@ table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nu
 th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 tbody tr { cursor: pointer; }
 tbody tr:hover, tbody tr.sel { background: #243140; }
+tbody tr.rejected { color: var(--bad); }
+tbody tr.contradicted { color: var(--warn); background: #3a2a14; }
+tbody tr.contested { color: var(--contested); }
+tbody tr.muted { color: var(--muted); cursor: default; }
 #detail { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; }
+
+.map-panel { min-height: 280px; }
+#map { width: 100%; height: auto; background: var(--unknown); border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; list-style: none; padding: 8px 0 0; margin: 0; color: var(--muted); font-size: 11px; }
+.legend li { display: flex; align-items: center; gap: 6px; }
+.swatch { width: 12px; height: 12px; border-radius: 2px; border: 1px solid var(--line); display: inline-block; }
+.swatch.occupied { background: var(--occupied); }
+.swatch.free { background: var(--free); }
+.swatch.unknown { background: var(--unknown); }
+.swatch.contested { background: repeating-linear-gradient(45deg, var(--contested), var(--contested) 3px, #7c4a0a 3px, #7c4a0a 6px); }
+.map-info { margin: 6px 0 0; color: var(--muted); }
+.hint { margin: 0 0 8px; color: var(--muted); }
+.evidence-list { list-style: none; margin: 0; padding: 0; }
+.evidence-list li { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.evidence-list button.link { background: none; color: var(--accent); padding: 0; font-weight: 500; text-decoration: underline; }
+.evidence-kind { color: var(--muted); margin-left: 6px; font-size: 11px; }
 
 @media (max-width: 1100px) {
   .grid { grid-template-columns: 1fr; grid-template-rows: none; height: auto; }
   .later { grid-template-columns: 1fr 1fr; }
-  .counters { grid-template-columns: repeat(4, 1fr); }
+  .counters { grid-template-columns: repeat(4, minmax(7rem, 1fr)); }
 }

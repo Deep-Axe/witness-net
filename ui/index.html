@@ -3,31 +3,31 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CoopX S1 — event viewer</title>
+  <title>CoopX S2 — event viewer</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="top">
     <div>
-      <h1>CoopX S1</h1>
-      <p class="tag">Signed observation → packet → checker → event log</p>
+      <h1>CoopX S2</h1>
+      <p class="tag">Signed observation → coverage → checker → assessment → map</p>
     </div>
     <label class="file">
       Load JSONL
       <input id="file" type="file" accept=".jsonl,.json,.txt">
     </label>
-    <div id="load-status" class="status">Open <code>?log=data/s1-events.jsonl</code> or pick a file.</div>
+    <div id="load-status" class="status">Open <code>?log=/data/s2-events.jsonl</code> or pick a file.</div>
   </header>
 
   <section class="counters" id="counters">
-    <div><span data-k="sent">0</span><label>bytes sent</label></div>
-    <div><span data-k="received">0</span><label>bytes received</label></div>
+    <div><span data-k="sent">0</span><label>sent (once per broadcast)</label></div>
+    <div><span data-k="received">0</span><label>received (per receiver)</label></div>
     <div><span data-k="loss">0</span><label>drops · loss</label></div>
     <div><span data-k="disconnected">0</span><label>drops · disconnect</label></div>
     <div><span data-k="budget">0</span><label>drops · budget</label></div>
     <div><span data-k="accepted">0</span><label>accepted</label></div>
     <div><span data-k="rejected">0</span><label>rejected</label></div>
-    <div><span data-k="schemaErrors">0</span><label>schema errors</label></div>
+    <div class="chip schema-chip"><span data-k="schemaErrors">0</span><label>schema errors</label></div>
   </section>
 
   <section class="timeline">
@@ -45,9 +45,9 @@
     </section>
 
     <section class="panel table-panel">
-      <h2>Events</h2>
+      <h2>Events ≤ t</h2>
       <div class="filters" id="filters"></div>
-      <div class="table-wrap">
+      <div class="table-wrap" id="table-wrap">
         <table>
           <thead>
             <tr>
@@ -70,17 +70,25 @@
         <h2>Camera views</h2>
         <p>Placeholder — ego / infra RGB in a later slice.</p>
       </section>
-      <section class="panel placeholder" data-slot="bev">
-        <h2>Tri-state BEV</h2>
-        <p>Placeholder — occupied / free / unknown map.</p>
+      <section class="panel map-panel" data-slot="bev">
+        <h2>Coverage map</h2>
+        <canvas id="map" width="480" height="480" aria-label="BEV coverage grid"></canvas>
+        <ul class="legend">
+          <li><span class="swatch occupied"></span>occupied</li>
+          <li><span class="swatch free"></span>free</li>
+          <li><span class="swatch unknown"></span>unknown</li>
+          <li><span class="swatch contested"></span>contested</li>
+        </ul>
+        <p id="map-info" class="map-info">Click a cell or assessed object.</p>
       </section>
-      <section class="panel placeholder" data-slot="evidence">
-        <h2>Evidence chain</h2>
-        <p>Placeholder — question → plan → queries → verdict.</p>
+      <section class="panel evidence-panel" data-slot="evidence">
+        <h2>Evidence</h2>
+        <p class="hint">Supporting and contradicting refs for the selected cell or object.</p>
+        <ul id="evidence-list" class="evidence-list"></ul>
       </section>
       <section class="panel placeholder" data-slot="muse">
         <h2>Muse call log</h2>
-        <p>Placeholder — latency, tokens, cost. Not part of S1.</p>
+        <p>Placeholder — latency, tokens, cost. Not part of S2.</p>
       </section>
     </div>
   </main>
