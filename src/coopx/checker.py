@@ -23,6 +23,7 @@ class CheckResult:
     codes: tuple[str, ...]
     state: str
     message: ObservationMessage | CoverageMessage | None
+    mode: str = "live"
 
 
 @dataclass(slots=True)
@@ -66,23 +67,57 @@ class Checker:
         """
         return self._latest.get((source_id, object_id))
 
-    def check(self, raw: bytes, now_us: int) -> CheckResult:
+    def check(self, raw: bytes, now_us: int, *, scene_time_us: int | None = None) -> CheckResult:
+        """Admit live traffic or explicitly requested historical evidence.
+
+        Live admission is unchanged. Snapshot admission requires capture within
+        300 ms of scene_time_us, generation no older than ttl_us at receipt,
+        unexpired validity at receipt, and the usual future/signature/identity/
+        replay/bounds checks. The requested scene itself must not be future.
+
+        This API has no question-dispatch time or signed query nonce: it CANNOT
+        prove a packet was produced in response to a particular question. A
+        previously generated but recently signed, first-delivered observation
+        is deliberately allowed; an already accepted packet is a duplicate in
+        either mode. Reuse previously admitted evidence by reference, never by
+        re-admitting its bytes. Old archived packets with old generation times
+        fail STALE even when the requested scene matches. Recent generation
+        authenticates an observer's assertion about a historical frame, not
+        current occupancy or the truth of the assertion.
+
+        Both modes share replay state; snapshot packets never update latest().
+        The caller MUST label mode='snapshot' and route these packets only to
+        snapshot Q&A, NEVER to Assessor, coverage updates or hazard warnings.
+        Consumer-chosen scene_time_us is a trusted request, not packet input.
+        """
         _nonnegative_int(now_us, "now_us")
+        mode = "snapshot" if scene_time_us is not None else "live"
+        if scene_time_us is not None:
+            _nonnegative_int(scene_time_us, "scene_time_us")
+            if scene_time_us > now_us:
+                raise ValueError("requested scene must not be in the future")
+        def result(codes, state, message):
+            return CheckResult(codes, state, message, mode)
         try:
             message = decode(raw)
         except (ValueError, TypeError, OverflowError, struct.error):
-            return CheckResult(("DECODE_ERROR",), "rejected", None)
+            return result(("DECODE_ERROR",), "rejected", None)
         envelope = message.envelope
         anchor = self.anchors.get(envelope.source_id)
         if anchor is None:
-            return CheckResult(("UNKNOWN_SOURCE",), "rejected", message)
+            return result(("UNKNOWN_SOURCE",), "rejected", message)
         if anchor.key_ref != envelope.auth.key_ref:
-            return CheckResult(("KEY_MISMATCH",), "rejected", message)
+            return result(("KEY_MISMATCH",), "rejected", message)
         if not verify(message, self.anchors):
-            return CheckResult(("BAD_SIGNATURE",), "rejected", message)
+            return result(("BAD_SIGNATURE",), "rejected", message)
 
         codes = []
-        if now_us - envelope.capture_time_us > self.ttl_us:
+        if scene_time_us is None:
+            stale = now_us - envelope.capture_time_us > self.ttl_us
+        else:
+            stale = (abs(envelope.capture_time_us - scene_time_us) > 300_000
+                     or now_us - envelope.generation_time_us > self.ttl_us)
+        if stale:
             codes.append("STALE")
         if now_us > envelope.valid_until_us:
             codes.append("EXPIRED")
@@ -109,7 +144,7 @@ class Checker:
         if any(not anchor.permits(xyz) for xyz in points):
             codes.append("OUTSIDE_PERMITTED_REGION")
         if codes:
-            return CheckResult(tuple(codes), "rejected", message)
+            return result(tuple(codes), "rejected", message)
 
         # Commit only after every gate passes. Sequence storage stays bounded;
         # IDs are retained for this run so refreshing an old ID cannot revive it.
@@ -120,9 +155,9 @@ class Checker:
             state.sequences.add(sequence)
             state.sequences = {seq for seq in state.sequences
                                if seq > state.highest - self.replay_window}
-        if isinstance(message, ObservationMessage):
+        if mode == "live" and isinstance(message, ObservationMessage):
             key = message.observation.key
             previous = self._latest.get(key)
             if previous is None or envelope.capture_time_us > previous.envelope.capture_time_us:
                 self._latest[key] = message
-        return CheckResult(("OK",), "accepted", message)
+        return result(("OK",), "accepted", message)
