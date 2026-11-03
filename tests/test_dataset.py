@@ -7,8 +7,8 @@ import numpy as np
 from PIL import Image
 import yaml
 
-from coopx.dataset.v2xreal import (GroundTruthBox, V2XReal, pose_to_site,
-                                 project_camera, transform_points)
+from coopx.dataset.v2xreal import (GroundTruthBox, V2XReal, point_in_polygon,
+                                 pose_to_site, project_camera, transform_points)
 
 
 class DatasetGeometryTests(unittest.TestCase):
@@ -42,6 +42,12 @@ class DatasetGeometryTests(unittest.TestCase):
                                                    np.linalg.inv(transform)), points, atol=1e-12)
         with self.assertRaises(ValueError):
             transform_points(points, np.diag([1, -1, 1, 1]))
+
+    def test_point_in_polygon_counts_boundary(self):
+        square = ((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0))
+        self.assertTrue(point_in_polygon((1.0, 1.0), square))
+        self.assertTrue(point_in_polygon((0.0, 1.0), square))
+        self.assertFalse(point_in_polygon((3.0, 1.0), square))
 
 
 class DatasetReaderTests(unittest.TestCase):

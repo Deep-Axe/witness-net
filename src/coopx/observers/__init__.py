@@ -1,8 +1,8 @@
-"""Synthetic observers for S2. Coverage semantics live in Agent A's modules."""
+"""Observers. Grid and coverage types come from coopx.coverage."""
 
+from coopx.coverage import CoverageContent, GridSpec
+from coopx.observers.camera import CameraObserver
 from coopx.observers.lidar_synth import (
-    CoverageContent,
-    GridSpec,
     LidarObserver,
     Rect,
     SynthWorld,
@@ -11,6 +11,7 @@ from coopx.observers.lidar_synth import (
 )
 
 __all__ = (
+    "CameraObserver",
     "CoverageContent",
     "GridSpec",
     "LidarObserver",

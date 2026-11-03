@@ -13,7 +13,8 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
-from math import floor
+import math
+import os
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -36,22 +37,23 @@ S1_TTL_US = 1_000_000
 S1_FRAME = "site_map"
 S1_SESSION = "s1"
 
-S2_NODES = ("pole1", "lidar1", "ghost1", "ghost2", "ego")
+S2_NODES = ("pole1", "pole2", "pole3", "lidar1", "ghost1", "ghost2", "ego")
 S2_DT_US = 100_000
 S2_DURATION_US = 5_000_000
 S2_TTL_US = 1_000_000
 S2_FRAME = "site_map"
 S2_SESSION = "s2"
 S2_GHOST_START_US = 2_000_000
+S2_REFLECTION_START_US = 3_000_000
 S2_LIDAR_POSE = (0.0, 0.0)
 S2_POLE_POSE = (0.0, -4.0)
 S2_GHOST_FREE_XYZ = (5.5, -8.5, 0.5)
 S2_GHOST_SILENT_XYZ = (24.0, 15.2, 0.5)  # behind the parked truck along a lidar ray
-
-# Wire grid (coopx.coverage.GridSpec) mirroring the observer's geometry grid.
-S2_GRID = GridSpec(float(lidar_synth.S2_GRID.origin_x), float(lidar_synth.S2_GRID.origin_y),
-                   float(lidar_synth.S2_GRID.cell_m), lidar_synth.S2_GRID.nx,
-                   lidar_synth.S2_GRID.ny)
+# Honest-but-wrong cameras: a reflection in glass, >1.5 m from ghost1 so they
+# cannot corroborate the class-B ghost (unanchored → never a witness).
+S2_REFLECTION_XYZ = (3.5, -12.5, 0.7)
+S2_REFLECTION_SOURCES = ("pole2", "pole3")
+S2_GRID = lidar_synth.S2_GRID
 
 
 class PassThroughChecker:
@@ -80,12 +82,13 @@ def demo_node_key(key_seed: int, name: str) -> NodeKey:
 
 def _anchors_and_keys(nodes: tuple[str, ...] = S1_NODES, *, key_seed: int | None = None,
                       trust: dict[str, TrustClass] | None = None,
-                      anchored: dict[str, bool] | None = None):
+                      anchored: dict[str, bool] | None = None,
+                      region: tuple[float, float, float, float, float, float] | None = None):
     keys = {
         name: demo_node_key(key_seed, name) if key_seed is not None else NodeKey.generate()
         for name in nodes
     }
-    region = (-200.0, -200.0, -10.0, 200.0, 200.0, 20.0)
+    region = region or (-200.0, -200.0, -10.0, 200.0, 200.0, 20.0)
     trust = trust or {name: TrustClass.A for name in nodes}
     anchored = anchored or {name: True for name in nodes}
     anchors = {}
@@ -173,33 +176,29 @@ def _ordered_events(events: list[dict]) -> list[dict]:
     return [item[3] for item in tagged]
 
 
-def _write_events(path: Path, events: list[dict]) -> list[dict]:
+def _write_events(path: Path, events: list[dict], *, overwrite: bool = False) -> list[dict]:
+    """Write via a same-directory temp file; replace only on success."""
     ordered = _ordered_events(events)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as handle:
-        for event in ordered:
-            handle.write(json.dumps(event, allow_nan=False, separators=(",", ":")) + "\n")
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"{path} exists; pass --overwrite to replace it")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("x", encoding="utf-8") as handle:
+            for event in ordered:
+                handle.write(json.dumps(event, allow_nan=False, separators=(",", ":")) + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
     return ordered
 
 
 # ---------------------------------------------------------------------------
 # S2 helpers: signed coverage, events
 # ---------------------------------------------------------------------------
-
-def wire_coverage(content: lidar_synth.CoverageContent, capture_us: int) -> CoverageContent:
-    """Observer output (contract 2) -> coopx.coverage.CoverageContent.
-
-    The capture window ends at the envelope capture time (coverage invariant).
-    """
-    spec = content.spec
-    grid = GridSpec(float(spec.origin_x), float(spec.origin_y), float(spec.cell_m),
-                    spec.nx, spec.ny)
-    return CoverageContent(
-        grid, (max(0, capture_us - S2_DT_US), capture_us), content.modality,
-        tuple(float(v) for v in content.height_band_m), float(content.min_size_m),
-        frozenset(content.observed), frozenset(content.free), frozenset(content.occupied))
-
 
 def _signed_coverage(source: str, key: NodeKey, content: CoverageContent, *, sim_us: int,
                      sensor_seq: int, message_id: str) -> CoverageMessage:
@@ -231,20 +230,33 @@ def _coverage_published_event(message: CoverageMessage, raw: bytes, sim_us: int)
         })
 
 
+def _grid_dict(spec) -> dict:
+    return {"origin": [spec.origin_x, spec.origin_y], "cell_m": spec.cell_m,
+            "nx": spec.nx, "ny": spec.ny}
+
+
+def _is_default_s2_grid(spec) -> bool:
+    return (spec.origin_x, spec.origin_y, spec.cell_m, spec.nx, spec.ny) == (
+        -10.0, -30.0, 1.0, 60, 60)
+
+
 def _assessment_event(message: ObservationMessage, assessment: Assessment,
-                      evidence_ref: str, now_us: int, nbytes: int) -> dict:
+                      evidence_ref: str, now_us: int, nbytes: int, *, spec=None) -> dict:
+    detail = {
+        "cells": [list(c) for c in assessment.cells],
+        "supporting": list(assessment.supporting),
+        "contradicting": list(assessment.contradicting),
+        "reason": assessment.reason,
+    }
+    if spec is not None and not _is_default_s2_grid(spec):
+        detail["grid"] = _grid_dict(spec)
     return make_event(
         t_replay_us=now_us, type="assessment",
         source_id=message.envelope.source_id, dest_id="ego",
         message_id=message.envelope.message_id, message_type="observation",
         evidence_ref=evidence_ref, bytes=nbytes,
         check_codes=list(assessment.codes), state=assessment.state,
-        detail={
-            "cells": [list(c) for c in assessment.cells],
-            "supporting": list(assessment.supporting),
-            "contradicting": list(assessment.contradicting),
-            "reason": assessment.reason,
-        })
+        detail=detail)
 
 
 def _map_snapshot_event(coverage_map: CoverageMap, now_us: int) -> dict:
@@ -254,6 +266,8 @@ def _map_snapshot_event(coverage_map: CoverageMap, now_us: int) -> dict:
         {"cell": cell, "claims": [[ref, kind] for ref, kind in
                                   coverage_map.claims_at(tuple(cell), now_us)]}
         for cell in detail["contested"]]
+    if not _is_default_s2_grid(coverage_map.spec):
+        detail["grid"] = _grid_dict(coverage_map.spec)
     return make_event(t_replay_us=now_us, type="map_snapshot", source_id="ego", detail=detail)
 
 
@@ -263,7 +277,7 @@ def _map_snapshot_event(coverage_map: CoverageMap, now_us: int) -> dict:
 
 def run_s1(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 100_000,
            jitter_us: int = 50_000, disconnect_at_us: int | None = None,
-           checker=None, key_seed: int | None = None) -> dict:
+           checker=None, key_seed: int | None = None, overwrite: bool = False) -> dict:
     """Replay ~5 s at 10 Hz. `checker=` defaults to the real Checker over this run's anchors."""
     if disconnect_at_us is not None and (type(disconnect_at_us) is not int or disconnect_at_us < 0):
         raise ValueError("disconnect_at_us must be a nonnegative int")
@@ -310,7 +324,7 @@ def run_s1(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
                            message_id=message.envelope.message_id, message_type="observation")
     drain_us = (S1_DURATION_US - S1_DT_US) + delay_us + jitter_us
     transport.receive_until(drain_us)
-    events[:] = _write_events(output, events)
+    events[:] = _write_events(output, events, overwrite=overwrite)
 
     by_type = Counter(event["type"] for event in events)
     return {
@@ -327,18 +341,20 @@ def run_s1(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
 
 def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 100_000,
-           jitter_us: int = 0, key_seed: int = 0, checker=None) -> dict:
+           jitter_us: int = 0, key_seed: int = 0, checker=None, overwrite: bool = False) -> dict:
     """Pole camera + LiDAR observer + two camera ghosts, judged with no LLM.
 
     Every packet goes through the real Checker. Admitted coverage feeds the
     CoverageMap; admitted observations are judged by the Assessor.
     """
     trust = {
-        "pole1": TrustClass.A, "lidar1": TrustClass.A, "ego": TrustClass.A,
+        "pole1": TrustClass.A, "pole2": TrustClass.A, "pole3": TrustClass.A,
+        "lidar1": TrustClass.A, "ego": TrustClass.A,
         "ghost1": TrustClass.B, "ghost2": TrustClass.B,
     }
     anchored = {
-        "pole1": True, "lidar1": True, "ego": True,
+        "pole1": True, "pole2": True, "pole3": True,
+        "lidar1": True, "ego": True,
         "ghost1": False, "ghost2": False,
     }
     keys, anchors = _anchors_and_keys(
@@ -350,11 +366,12 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
     assessor = Assessor(store, coverage_map)
 
     world = default_s2_world()
-    lidar = LidarObserver(lidar_synth.S2_GRID, pose=S2_LIDAR_POSE, seed=seed)
+    lidar = LidarObserver(S2_GRID, pose=S2_LIDAR_POSE, seed=seed)
     events: list[dict] = []
     accepted = rejected = 0
     outcomes: Counter = Counter()
     sequences: Counter = Counter()
+    reflection_latest: dict[str, tuple] = {}
 
     def next_seq(source: str) -> int:
         # One increasing stream per source across coverage and object packets.
@@ -376,10 +393,25 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
         if isinstance(result.message, CoverageMessage):
             coverage_map.add(result.message, now_us)
             return
-        assessment = assessor.assess(result.message, now_us)
-        events.append(_assessment_event(
-            result.message, assessment, delivery.evidence_ref, now_us, len(delivery.packet)))
-        outcomes[(result.message.envelope.source_id, assessment.codes[0])] += 1
+        source = result.message.envelope.source_id
+        if source in S2_REFLECTION_SOURCES:
+            reflection_latest[source] = (
+                result.message, delivery.evidence_ref, len(delivery.packet))
+            # Wait until both honest-but-wrong cameras are admitted so each
+            # assessment sees two independent witnesses + LiDAR free space.
+            if len(reflection_latest) < 2:
+                return
+            to_judge = list(reflection_latest.values())
+        else:
+            to_judge = [(result.message, delivery.evidence_ref, len(delivery.packet))]
+        # Both cameras must be in the store before either is judged, otherwise
+        # the first looks like a lone ghost (contradicted, not contested).
+        for message, _ref, _nbytes in to_judge:
+            store.add(message)
+        for message, ref, nbytes in to_judge:
+            assessment = assessor.assess(message, now_us)
+            events.append(_assessment_event(message, assessment, ref, now_us, nbytes))
+            outcomes[(message.envelope.source_id, assessment.codes[0])] += 1
 
     transport = PacketTransport(
         S2_NODES, delay_us=delay_us, jitter_us=jitter_us, loss_probability=loss,
@@ -413,7 +445,7 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
         scan = lidar.scan(world, t_us=sim_us)
         cov_id = f"lidar1-cov-{frame:04d}"
         coverage = _signed_coverage(
-            "lidar1", keys["lidar1"], wire_coverage(scan, sim_us), sim_us=sim_us,
+            "lidar1", keys["lidar1"], scan, sim_us=sim_us,
             sensor_seq=next_seq("lidar1"), message_id=cov_id)
         raw_cov = encode(coverage)
         events.append(_coverage_published_event(coverage, raw_cov, sim_us))
@@ -433,11 +465,16 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
             publish_observation(
                 "ghost2", 92, frame, sim_us, ObjectClass.PEDESTRIAN,
                 S2_GHOST_SILENT_XYZ, (0.0, 0.0, 0.0))
+        if sim_us >= S2_REFLECTION_START_US:
+            for source, object_id in (("pole2", 81), ("pole3", 82)):
+                publish_observation(
+                    source, object_id, frame, sim_us, ObjectClass.PEDESTRIAN,
+                    S2_REFLECTION_XYZ, (0.0, 0.0, 0.0))
 
     drain_us = (S2_DURATION_US - S2_DT_US) + delay_us + jitter_us
     transport.receive_until(drain_us)
     events.append(_map_snapshot_event(coverage_map, drain_us))
-    events[:] = _write_events(output, events)
+    events[:] = _write_events(output, events, overwrite=overwrite)
 
     by_type = Counter(event["type"] for event in events)
     return {
@@ -456,4 +493,436 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
             "origin": [S2_GRID.origin_x, S2_GRID.origin_y],
             "cell_m": S2_GRID.cell_m, "nx": S2_GRID.nx, "ny": S2_GRID.ny,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# S3: one dataset frame, SAM observer, stub Reasoner
+# Seams (reviewer swaps in Agent A): _s3_reasoner, _s3_answer, _s3_lift
+# ---------------------------------------------------------------------------
+
+S3_SCENARIO = "2023-04-04-14-28-53_45_0"
+S3_RSU = "-2"
+S3_RSU_NEAR = "-1"
+S3_EGO = "2"
+S3_NODES = ("rsu-2", "rsu-1", "ego")
+S3_SESSION = "s3"
+S3_TTL_US = 5_000_000
+S3_DATASET = Path("/home/deep/meta_hackathon/data/v2x-real/val")
+S3_OVERLAY = Path("data/s3/overlay.png")
+S3_REGION = (-1000.0, -1000.0, -50.0, 1000.0, 1000.0, 80.0)
+_S3_PICK_CACHE = {}
+
+
+@dataclass(frozen=True)
+class S3FramePick:
+    scenario: str
+    frame_id: str
+    rsu_id: str
+    ego_id: str
+    camera_name: str
+    pedestrian_id: str
+    other_camera: str
+    other_rsu_id: str
+
+
+@dataclass(frozen=True)
+class Verdict:
+    verdict_id: str
+    subject: str
+    state: str
+    evidence_refs: tuple[str, ...]
+    reason: str
+    model_call_ids: tuple[str, ...]
+
+
+def _s3_lift():
+    """Seam: replace with `from coopx.observers.camera_lift import lift_box`."""
+    from coopx.observers.camera import stub_lift_box
+    return stub_lift_box
+
+
+def _s3_answer():
+    """Seam: replace with `from coopx.query import answer_query`."""
+    from coopx.observers.camera import stub_answer_query
+    return stub_answer_query
+
+
+class StubReasoner:
+    """Plan one T3 person query at the covering observer; judge from answers.
+
+    Makes no paid Spark calls (precomputed ModelResult, cost 0).
+    """
+
+    def __init__(self, client, *, model="muse-spark-1.3", max_queries=4):
+        self.client = client
+        self.model = model
+        self.max_queries = max_queries
+
+    def _result(self, now_us: int, stage: str, call_id: str):
+        from coopx.meta.client import ModelResult
+        return ModelResult(
+            text=f"stub {stage}", json=None, call_id=call_id, product=self.model,
+            cache_hit=False, latency_ms=0.0, input_tokens=0, output_tokens=0,
+            images=0, cost_usd=0.0, query_time_us=now_us,
+            availability_time_us=now_us, precomputed=True, stage=stage)
+
+    def plan(self, question: str, capabilities, context: dict, now_us: int):
+        from coopx.dataset.v2xreal import point_in_polygon
+        from coopx.observers.camera import Query
+        region = context["region"]
+        center = tuple(region["center"])
+        chosen = next((cap for cap in capabilities
+                       if point_in_polygon(center, cap.coverage_xy)), capabilities[0])
+        query = Query(
+            "q-s3-0", "T3", chosen.observer_id, center, float(region["radius_m"]),
+            now_us, "person", "footprint covers the asked region")
+        return [query], self._result(now_us, "plan", "stub-plan")
+
+    def judge(self, question: str, queries, answers, evidence: dict, now_us: int):
+        refs = []
+        for answer in answers:
+            if answer.result == "detected":
+                refs.extend(answer.evidence_refs)
+        refs = tuple(dict.fromkeys(refs))
+        state = "corroborated" if refs else "unverified"
+        reason = ("stub judge: detections cited" if refs
+                  else "stub judge: no detected evidence")
+        return ([Verdict("v-s3-0", "region-pedestrian", state, refs, reason, ())],
+                self._result(now_us, "judge", "stub-judge"))
+
+
+def _s3_reasoner(client):
+    """Seam: replace with `from coopx.meta.reasoner import Reasoner`."""
+    return StubReasoner(client)
+
+
+def stub_execute(queries, capabilities, observers, *, max_queries=4):
+    """Validate every query before calling any observer (contract 9 execute)."""
+    if len(queries) > max_queries:
+        raise ValueError("too many queries")
+    by_id = {cap.observer_id: cap for cap in capabilities}
+    answers = []
+    for query in queries:
+        cap = by_id.get(query.observer_id)
+        if cap is None or query.observer_id not in observers:
+            continue
+        if query.tier not in cap.query_tiers:
+            from coopx.observers.camera import Answer
+            answers.append(Answer(query.query_id, query.observer_id, "unsupported",
+                                  None, None, ()))
+            continue
+        if not all(math.isfinite(v) for v in query.center_xy) or query.radius_m <= 0:
+            continue
+        answers.append(observers[query.observer_id](query))
+    return answers
+
+
+def _s3_execute():
+    """Seam: replace with `from coopx.meta.reasoner import execute`."""
+    return stub_execute
+
+
+def pick_s3_frame(dataset_root: Path = S3_DATASET, *,
+                  scenario: str = S3_SCENARIO, rsu_id: str = S3_RSU,
+                  ego_id: str = S3_EGO) -> S3FramePick:
+    """Deterministic first frame with a fully-visible RSU pedestrian."""
+    cache_key = (str(dataset_root), scenario, rsu_id, ego_id)
+    if cache_key in _S3_PICK_CACHE:
+        return _S3_PICK_CACHE[cache_key]
+    from coopx.dataset.v2xreal import (V2XReal, box_fully_in_camera, count_lidar_in_box)
+    dataset = V2XReal(dataset_root)
+    frame_ids = dataset.aligned_frame_ids(scenario, (rsu_id, ego_id, S3_RSU_NEAR))
+    if not frame_ids:
+        frame_ids = dataset.aligned_frame_ids(scenario, (rsu_id, ego_id))
+    preferred = None
+    fallback = None
+    for frame_id in frame_ids:
+        rsu = dataset.read(scenario, rsu_id, frame_id)
+        ego = dataset.read(scenario, ego_id, frame_id)
+        pedestrians = [b for b in rsu.boxes.values() if b.label.lower() == "pedestrian"]
+        ego_xy = (float(ego.lidar_to_site[0, 3]), float(ego.lidar_to_site[1, 3]))
+        for box in pedestrians:
+            center = box.center_site()
+            if math.hypot(center[0] - ego_xy[0], center[1] - ego_xy[1]) > 40.0:
+                continue
+            for camera_name in sorted(rsu.cameras):
+                if not box_fully_in_camera(rsu, box, camera_name):
+                    continue
+                if count_lidar_in_box(rsu, box) < 20:
+                    continue
+                hidden_from_ego = not any(
+                    box_fully_in_camera(ego, box, ego_cam) for ego_cam in ego.cameras)
+                pick = S3FramePick(
+                    scenario, frame_id, rsu_id, ego_id, camera_name, box.object_id,
+                    sorted(rsu.cameras)[0] if sorted(rsu.cameras)[0] != camera_name
+                    else (sorted(rsu.cameras)[1] if len(rsu.cameras) > 1 else camera_name),
+                    S3_RSU_NEAR)
+                if hidden_from_ego:
+                    _S3_PICK_CACHE[cache_key] = pick
+                    return pick
+                if fallback is None:
+                    fallback = pick
+    if fallback is not None:
+        _S3_PICK_CACHE[cache_key] = fallback
+        return fallback
+    raise FileNotFoundError(
+        f"no S3 pedestrian frame in {scenario} rsu={rsu_id} ego={ego_id}")
+
+
+def _scene_grid(points_xy, *, cell_m=1.0, pad=15.0) -> GridSpec:
+    xs, ys = zip(*points_xy)
+    x0 = math.floor(min(xs) - pad)
+    y0 = math.floor(min(ys) - pad)
+    x1 = math.ceil(max(xs) + pad)
+    y1 = math.ceil(max(ys) + pad)
+    nx = max(8, min(200, math.ceil((x1 - x0) / cell_m)))
+    ny = max(8, min(200, math.ceil((y1 - y0) / cell_m)))
+    return GridSpec(float(x0), float(y0), float(cell_m), nx, ny)
+
+
+def _write_s3_overlay(path: Path, frame, camera_name: str, detections, gt_box) -> None:
+    from PIL import Image, ImageDraw
+    from coopx.dataset.v2xreal import project_camera
+    image = Image.open(frame.cameras[camera_name].image_path).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    for detection in detections:
+        draw.rectangle(detection.box_xyxy, outline=(0, 220, 80), width=3)
+    if gt_box is not None:
+        uv, _depth, valid = project_camera(
+            frame.to_camera(gt_box.corners_site(), camera_name),
+            frame.cameras[camera_name].intrinsic)
+        if valid.all():
+            xs, ys = uv[:, 0], uv[:, 1]
+            draw.rectangle((float(xs.min()), float(ys.min()),
+                            float(xs.max()), float(ys.max())),
+                           outline=(220, 40, 40), width=2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
+
+
+def _query_event(query, now_us: int) -> dict:
+    return make_event(
+        t_replay_us=now_us, type="query", source_id="reasoner",
+        dest_id=query.observer_id, message_id=query.query_id, message_type="query",
+        detail={
+            "tier": query.tier,
+            "region": {"center": [query.center_xy[0], query.center_xy[1]],
+                       "radius_m": query.radius_m},
+            "time_us": query.time_us, "concept": query.concept, "reason": query.reason,
+        })
+
+
+def _answer_event(answer, now_us: int) -> dict:
+    return make_event(
+        t_replay_us=now_us, type="answer", source_id=answer.observer_id,
+        dest_id="reasoner", message_id=answer.query_id, message_type="answer",
+        state=answer.result,
+        detail={
+            "observed_time_us": answer.observed_time_us,
+            "coverage_ref": answer.coverage_ref,
+            "evidence_refs": list(answer.evidence_refs),
+        })
+
+
+def _verdict_event(verdict, now_us: int) -> dict:
+    return make_event(
+        t_replay_us=now_us, type="verdict", source_id="reasoner",
+        message_id=verdict.verdict_id, message_type="verdict", state=verdict.state,
+        detail={
+            "subject": verdict.subject,
+            "evidence_refs": list(verdict.evidence_refs),
+            "reason": verdict.reason,
+            "model_call_ids": list(verdict.model_call_ids),
+        })
+
+
+def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
+           budget_usd: float = 3.0, overwrite: bool = False,
+           dataset_root: Path = S3_DATASET, client=None,
+           delay_us: int = 100_000, overlay: Path = S3_OVERLAY) -> dict:
+    """One V2X-Real frame: SAM fast path, then a stub-planned region question."""
+    from coopx.dataset.v2xreal import V2XReal
+    from coopx.envelope import encode, evidence_ref
+    from coopx.meta.client import MetaClient
+    from coopx.dataset.v2xreal import camera_footprint_xy, point_in_polygon
+    from coopx.observers.camera import (CameraObserver, jpeg_to_camera_frame,
+                                       rsu_camera_capability)
+
+    pick = pick_s3_frame(dataset_root)
+    dataset = V2XReal(dataset_root)
+    rsu = dataset.read(pick.scenario, pick.rsu_id, pick.frame_id)
+    other = dataset.read(pick.scenario, pick.other_rsu_id, pick.frame_id)
+    ego = dataset.read(pick.scenario, pick.ego_id, pick.frame_id)
+    pedestrian = rsu.boxes[pick.pedestrian_id]
+    center = tuple(float(v) for v in pedestrian.center_site())
+
+    cap_rsu = rsu_camera_capability("rsu-2", rsu, pick.camera_name)
+    other_cam = None
+    for name in sorted(other.cameras):
+        if not point_in_polygon(center[:2], camera_footprint_xy(other, name)):
+            other_cam = name
+            break
+    if other_cam is None:
+        other_cam = pick.other_camera if pick.other_camera in other.cameras else sorted(other.cameras)[0]
+    cap_other = rsu_camera_capability("rsu-1", other, other_cam)
+    capabilities = [cap_rsu, cap_other]
+
+    points = [
+        (float(rsu.lidar_to_site[0, 3]), float(rsu.lidar_to_site[1, 3])),
+        (float(ego.lidar_to_site[0, 3]), float(ego.lidar_to_site[1, 3])),
+        center[:2],
+    ]
+    grid = _scene_grid(points)
+    keys, anchors = _anchors_and_keys(
+        S3_NODES, key_seed=key_seed,
+        trust={name: TrustClass.A for name in S3_NODES},
+        anchored={name: True for name in S3_NODES},
+        region=S3_REGION)
+    checker = Checker(anchors, ttl_us=S3_TTL_US)
+    store = EvidenceStore(anchors)
+    coverage_map = CoverageMap(grid, ttl_us=S3_TTL_US, spatial_frame_id=S2_FRAME, store=store)
+    assessor = Assessor(store, coverage_map)
+
+    if client is None:
+        client = MetaClient(budget_usd=budget_usd, offline=offline)
+    lift_fn = _s3_lift()
+    answer_fn = _s3_answer()
+    events: list[dict] = []
+    accepted = rejected = 0
+    admitted: list = []
+
+    def on_delivery(delivery: PacketDelivery) -> None:
+        nonlocal accepted, rejected
+        if delivery.receiver != "ego":
+            return
+        now_us = delivery.available_sim_us
+        result = checker.check(delivery.packet, now_us)
+        events.append(_check_event(delivery, result, now_us))
+        if result.state != "accepted":
+            rejected += 1
+            return
+        accepted += 1
+        if isinstance(result.message, ObservationMessage):
+            admitted.append(result.message)
+            assessment = assessor.assess(result.message, now_us)
+            events.append(_assessment_event(
+                result.message, assessment, delivery.evidence_ref, now_us,
+                len(delivery.packet), spec=grid))
+
+    transport = PacketTransport(
+        S3_NODES, delay_us=delay_us, jitter_us=0, loss_probability=0.0,
+        seed=0, event_callback=events.append, delivery_callback=on_delivery)
+
+    def frame_source():
+        return jpeg_to_camera_frame(rsu, pick.camera_name)
+
+    observer = CameraObserver(
+        "rsu-2", frame_source, pick.camera_name, client, lift_fn, keys["rsu-2"],
+        session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_fn)
+    published = observer.observe()
+    events.extend(observer.drain_events())
+    publish_us = published[0].envelope.generation_time_us if published else rsu.nominal_time_us
+    for message in published:
+        raw = encode(message)
+        events.append(make_event(
+            t_replay_us=message.envelope.generation_time_us, type="observation_published",
+            source_id="rsu-2", message_id=message.envelope.message_id,
+            message_type="observation", evidence_ref=evidence_ref(message),
+            bytes=len(raw),
+            detail={"xyz": list(message.observation.xyz_m),
+                    "cls": message.observation.cls.name,
+                    "sensor_seq": message.envelope.sensor_seq}))
+        transport.send("rsu-2", raw, sim_us=message.envelope.generation_time_us,
+                       message_id=message.envelope.message_id, message_type="observation")
+        publish_us = max(publish_us, message.envelope.generation_time_us)
+
+    drain_us = publish_us + delay_us
+    transport.receive_until(drain_us)
+    events.append(_map_snapshot_event(coverage_map, drain_us))
+
+    t_q = drain_us
+    question = "Is anyone in the crosswalk ahead of the ego?"
+    context = {"region": {"center": [center[0], center[1]], "radius_m": 4.0},
+               "admitted": len(admitted)}
+    reasoner = _s3_reasoner(client)
+    queries, plan_result = reasoner.plan(question, capabilities, context, t_q)
+    from coopx.meta.client import model_call_event
+    if not plan_result.precomputed:
+        events.append(model_call_event(plan_result, "reasoner"))
+    plan_avail = plan_result.availability_time_us
+    for query in queries:
+        events.append(_query_event(query, plan_avail))
+
+    def publish_message(message) -> None:
+        raw = encode(message)
+        events.append(make_event(
+            t_replay_us=message.envelope.generation_time_us, type="observation_published",
+            source_id=message.envelope.source_id, message_id=message.envelope.message_id,
+            message_type="observation", evidence_ref=evidence_ref(message),
+            bytes=len(raw),
+            detail={"xyz": list(message.observation.xyz_m),
+                    "cls": message.observation.cls.name,
+                    "sensor_seq": message.envelope.sensor_seq}))
+        transport.send(message.envelope.source_id, raw,
+                       sim_us=message.envelope.generation_time_us,
+                       message_id=message.envelope.message_id, message_type="observation")
+
+    def call_rsu2(query):
+        before = len(observer._admitted)
+        answer = observer.on_query(query, cap_rsu)
+        for message in observer._admitted[before:]:
+            publish_message(message)
+        return answer
+
+    def call_rsu1(query):
+        return answer_fn(query, cap_other, [], [], query.time_us)
+
+    execute = _s3_execute()
+    answers = execute(queries, capabilities, {"rsu-2": call_rsu2, "rsu-1": call_rsu1})
+    events.extend(observer.drain_events())
+    answer_us = plan_avail
+    for extra in events:
+        if extra["type"] in ("model_call", "observation_published"):
+            answer_us = max(answer_us, extra["t_replay_us"])
+    later = answer_us + delay_us
+    transport.receive_until(later)
+    for answer in answers:
+        events.append(_answer_event(answer, max(answer_us, later)))
+
+    verdicts, judge_result = reasoner.judge(question, queries, answers, {}, answer_us)
+    if not judge_result.precomputed:
+        events.append(model_call_event(judge_result, "reasoner"))
+    judge_avail = max(answer_us, judge_result.availability_time_us)
+    for verdict in verdicts:
+        events.append(_verdict_event(verdict, judge_avail))
+
+    try:
+        _write_s3_overlay(overlay, rsu, pick.camera_name, observer.last_detections, pedestrian)
+    except OSError:
+        pass
+
+    events[:] = _write_events(output, events, overwrite=overwrite)
+    by_type = Counter(event["type"] for event in events)
+    model_cost = sum(e["detail"].get("cost_usd", 0) for e in events if e["type"] == "model_call")
+    return {
+        "events": str(output),
+        "events_by_type": dict(by_type),
+        "scenario": pick.scenario,
+        "frame_id": pick.frame_id,
+        "rsu_id": pick.rsu_id,
+        "ego_id": pick.ego_id,
+        "camera_name": pick.camera_name,
+        "pedestrian_id": pick.pedestrian_id,
+        "accepted": accepted,
+        "rejected": rejected,
+        "n_events": len(events),
+        "model_call_count": by_type.get("model_call", 0),
+        "model_cost_usd": model_cost,
+        "question": question,
+        "overlay": str(overlay),
+        "grid": _grid_dict(grid),
+        "checker": type(checker).__name__,
+        "reasoner": type(reasoner).__name__,
     }

@@ -1,7 +1,6 @@
 """Synthetic 2-D LiDAR: ray-cast coverage and geometric object clusters.
 
-Local dataclasses mirror S2 contracts 1–2 so this package does not import
-`coopx.coverage` (Agent A). The reviewer swaps the real types at merge.
+Uses the shared `coopx.coverage` grid and coverage types (one schema).
 """
 
 from __future__ import annotations
@@ -9,64 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import atan2, cos, floor, hypot, pi, sin
 
-S2_GRID_ORIGIN = (-10.0, -30.0)
-S2_CELL_M = 1.0
-S2_NX = 60
-S2_NY = 60
+from coopx.coverage import CoverageContent, GridSpec
 
-
-@dataclass(frozen=True, slots=True)
-class GridSpec:
-    origin_x: float
-    origin_y: float
-    cell_m: float
-    nx: int
-    ny: int
-
-    def __post_init__(self) -> None:
-        if self.cell_m <= 0 or self.nx < 1 or self.ny < 1:
-            raise ValueError("invalid grid spec")
-
-    def cell_of(self, x: float, y: float) -> tuple[int, int]:
-        return (floor((x - self.origin_x) / self.cell_m),
-                floor((y - self.origin_y) / self.cell_m))
-
-    def in_bounds(self, ix: int, iy: int) -> bool:
-        return 0 <= ix < self.nx and 0 <= iy < self.ny
-
-    def cell_centre(self, ix: int, iy: int) -> tuple[float, float]:
-        return (self.origin_x + (ix + 0.5) * self.cell_m,
-                self.origin_y + (iy + 0.5) * self.cell_m)
-
-    def cell_bounds(self, ix: int, iy: int) -> tuple[float, float, float, float]:
-        x0 = self.origin_x + ix * self.cell_m
-        y0 = self.origin_y + iy * self.cell_m
-        return x0, y0, x0 + self.cell_m, y0 + self.cell_m
-
-
-S2_GRID = GridSpec(S2_GRID_ORIGIN[0], S2_GRID_ORIGIN[1], S2_CELL_M, S2_NX, S2_NY)
-
-
-@dataclass(frozen=True, slots=True)
-class CoverageContent:
-    """Plain stand-in for Agent A's CoverageContent (contract 2)."""
-
-    spec: GridSpec
-    window_us: tuple[int, int]
-    modality: str
-    height_band_m: tuple[float, float]
-    min_size_m: float
-    observed: frozenset[tuple[int, int]]
-    free: frozenset[tuple[int, int]]
-    occupied: frozenset[tuple[int, int]]
-
-    def __post_init__(self) -> None:
-        if self.free - self.observed or self.occupied - self.observed:
-            raise ValueError("free and occupied must be subsets of observed")
-        if self.free & self.occupied:
-            raise ValueError("free and occupied must be disjoint")
-        if self.modality == "camera_rgb" and self.free:
-            raise ValueError("camera_rgb coverage cannot claim free cells")
+S2_SCAN_DT_US = 100_000
+S2_GRID = GridSpec(-10.0, -30.0, 1.0, 60, 60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,8 +26,8 @@ class Rect:
         if self.xmin >= self.xmax or self.ymin >= self.ymax:
             raise ValueError("rect needs positive area")
 
-    def intersects_cell(self, spec: GridSpec, ix: int, iy: int) -> bool:
-        x0, y0, x1, y1 = spec.cell_bounds(ix, iy)
+    def intersects_cell(self, spec: GridSpec, cell: tuple[int, int]) -> bool:
+        x0, y0, x1, y1 = spec.cell_bounds(cell)
         return self.xmin < x1 and self.xmax > x0 and self.ymin < y1 and self.ymax > y0
 
 
@@ -125,8 +70,9 @@ class SynthWorld:
             iy1 = floor((rect.ymax - spec.origin_y) / spec.cell_m) + 1
             for ix in range(ix0, ix1):
                 for iy in range(iy0, iy1):
-                    if spec.in_bounds(ix, iy) and rect.intersects_cell(spec, ix, iy):
-                        cells.add((ix, iy))
+                    cell = (ix, iy)
+                    if spec.contains(cell) and rect.intersects_cell(spec, cell):
+                        cells.add(cell)
         return frozenset(cells)
 
 
@@ -152,7 +98,7 @@ def cluster_occupied(cells: frozenset[tuple[int, int]]) -> list[frozenset[tuple[
 
 
 def cluster_geometry(cluster: frozenset[tuple[int, int]], spec: GridSpec) -> dict:
-    xs, ys = zip(*(spec.cell_centre(ix, iy) for ix, iy in cluster))
+    xs, ys = zip(*(spec.cell_centre(cell) for cell in cluster))
     ix0, iy0 = min(c[0] for c in cluster), min(c[1] for c in cluster)
     ix1, iy1 = max(c[0] for c in cluster), max(c[1] for c in cluster)
     return {
@@ -179,9 +125,12 @@ class LidarObserver:
 
     def __init__(self, spec: GridSpec = S2_GRID, *, pose: tuple[float, float] = (0.0, 0.0),
                  n_beams: int = 720, range_m: float = 40.0, height_band_m: tuple[float, float] = (0.2, 2.0),
-                 min_size_m: float = 0.3, seed: int = 0, step_m: float | None = None):
+                 min_size_m: float = 0.3, seed: int = 0, step_m: float | None = None,
+                 dt_us: int = S2_SCAN_DT_US):
         if n_beams < 1 or range_m <= 0:
             raise ValueError("invalid lidar geometry")
+        if type(dt_us) is not int or dt_us < 0:
+            raise ValueError("dt_us must be a nonnegative int")
         self.spec = spec
         self.pose = pose
         self.n_beams = n_beams
@@ -190,6 +139,7 @@ class LidarObserver:
         self.min_size_m = min_size_m
         self.step_m = spec.cell_m / 4.0 if step_m is None else step_m
         self.seed = seed
+        self.dt_us = dt_us
 
     def scan(self, world: SynthWorld, *, t_us: int, window_us: tuple[int, int] | None = None) -> CoverageContent:
         t_s = t_us / 1_000_000
@@ -202,7 +152,8 @@ class LidarObserver:
             angle = 2.0 * pi * i / self.n_beams
             dx, dy = cos(angle), sin(angle)
             self._cast_beam(ox, oy, dx, dy, blocked, free, occupied, observed)
-        window = window_us if window_us is not None else (t_us, t_us)
+        # Coverage window ends at capture time (shared coverage invariant).
+        window = window_us if window_us is not None else (max(0, t_us - self.dt_us), t_us)
         return CoverageContent(
             self.spec, window, "lidar", self.height_band_m, self.min_size_m,
             frozenset(observed), frozenset(free), frozenset(occupied))
@@ -219,20 +170,20 @@ class LidarObserver:
         last: tuple[int, int] | None = None
         while dist <= self.range_m:
             x, y = ox + dx * dist, oy + dy * dist
-            ix, iy = self.spec.cell_of(x, y)
-            if not self.spec.in_bounds(ix, iy):
+            cell = self.spec.cell_at(x, y)
+            if not self.spec.contains(cell):
                 return
-            if last == (ix, iy):
+            if last == cell:
                 dist += self.step_m
                 continue
-            last = (ix, iy)
-            observed.add((ix, iy))
-            if (ix, iy) in blocked:
-                occupied.add((ix, iy))
-                free.discard((ix, iy))
+            last = cell
+            observed.add(cell)
+            if cell in blocked:
+                occupied.add(cell)
+                free.discard(cell)
                 return
-            if (ix, iy) not in occupied:
-                free.add((ix, iy))
+            if cell not in occupied:
+                free.add(cell)
             dist += self.step_m
 
     def bearing_to(self, x: float, y: float) -> float:

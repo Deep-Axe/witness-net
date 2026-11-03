@@ -19,11 +19,11 @@ from coopx.pipeline import (
     S2_GHOST_FREE_XYZ,
     S2_GHOST_SILENT_XYZ,
     S2_NODES,
+    S2_REFLECTION_XYZ,
     S2_TTL_US,
     _anchors_and_keys,
     _signed_coverage,
     run_s2,
-    wire_coverage,
 )
 from coopx.transport import EVENT_KEYS, EVENT_TYPES
 
@@ -178,8 +178,8 @@ class S2PipelineTests(unittest.TestCase):
     def test_ghost_in_free_space_and_silence_cells(self):
         lidar = LidarObserver(S2_GRID, pose=(0.0, 0.0), seed=0)
         coverage = lidar.scan(default_s2_world(), t_us=2_000_000)
-        free_cell = S2_GRID.cell_of(*S2_GHOST_FREE_XYZ[:2])
-        silent_cell = S2_GRID.cell_of(*S2_GHOST_SILENT_XYZ[:2])
+        free_cell = S2_GRID.cell_at(*S2_GHOST_FREE_XYZ[:2])
+        silent_cell = S2_GRID.cell_at(*S2_GHOST_SILENT_XYZ[:2])
         self.assertIn(free_cell, coverage.free)
         self.assertNotIn(silent_cell, coverage.observed)
 
@@ -226,7 +226,7 @@ class S2PipelineTests(unittest.TestCase):
             events = load_events(path)
             published = {e["evidence_ref"]: e for e in events
                          if e["type"] in ("coverage_published", "observation_published")}
-            ghost_cell = list(S2_GRID.cell_of(*S2_GHOST_FREE_XYZ[:2]))
+            ghost_cell = list(S2_GRID.cell_at(*S2_GHOST_FREE_XYZ[:2]))
             snaps = [e for e in events if e["type"] == "map_snapshot"]
             contested = [s for s in snaps if ghost_cell in s["detail"]["contested"]]
             self.assertTrue(contested)
@@ -237,24 +237,68 @@ class S2PipelineTests(unittest.TestCase):
                 kinds = {(published[ref]["source_id"], kind) for ref, kind in entry["claims"]}
                 self.assertIn(("lidar1", "free"), kinds)
                 self.assertIn(("ghost1", "occupied"), kinds)
-            silent_cell = list(S2_GRID.cell_of(*S2_GHOST_SILENT_XYZ[:2]))
+            silent_cell = list(S2_GRID.cell_at(*S2_GHOST_SILENT_XYZ[:2]))
             self.assertFalse(any(silent_cell in s["detail"]["contested"] for s in snaps))
 
     def test_coverage_is_signed_and_forgery_is_rejected(self):
         keys, anchors = _anchors_and_keys(S2_NODES, key_seed=1)
         checker = Checker(anchors, ttl_us=S2_TTL_US)
         scan = LidarObserver(S2_GRID, seed=0).scan(default_s2_world(), t_us=100_000)
-        content = wire_coverage(scan, 100_000)
-        honest = _signed_coverage("lidar1", keys["lidar1"], content, sim_us=100_000,
+        honest = _signed_coverage("lidar1", keys["lidar1"], scan, sim_us=100_000,
                                   sensor_seq=0, message_id="c0")
         raw = encode(honest)
         self.assertEqual(raw[:4], b"CX2C")
         self.assertEqual(evidence_ref(decode(raw)), evidence_ref(honest))
         self.assertEqual(checker.check(raw, 150_000).codes, ("OK",))
         # A ghost cannot publish free space in the LiDAR's name.
-        forged = encode(_signed_coverage("lidar1", keys["ghost1"], content, sim_us=100_000,
+        forged = encode(_signed_coverage("lidar1", keys["ghost1"], scan, sim_us=100_000,
                                          sensor_seq=1, message_id="c1"))
         self.assertEqual(checker.check(forged, 150_000).codes, ("BAD_SIGNATURE",))
+
+    def test_reflection_cameras_are_contested_by_lidar_free_space(self):
+        lidar = LidarObserver(S2_GRID, pose=(0.0, 0.0), seed=0)
+        coverage = lidar.scan(default_s2_world(), t_us=3_000_000)
+        cell = S2_GRID.cell_at(*S2_REFLECTION_XYZ[:2])
+        self.assertIn(cell, coverage.free)
+        self.assertGreater(
+            ((S2_REFLECTION_XYZ[0] - S2_GHOST_FREE_XYZ[0]) ** 2
+             + (S2_REFLECTION_XYZ[1] - S2_GHOST_FREE_XYZ[1]) ** 2) ** 0.5,
+            1.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s2.jsonl"
+            self._run(path)
+            events = load_events(path)
+            for event in events:
+                event_schema.validate(event)
+            coverage_refs = {e["evidence_ref"] for e in events
+                             if e["type"] == "coverage_published" and e["source_id"] == "lidar1"}
+            published = {e["evidence_ref"]: e for e in events
+                         if e["type"] in ("coverage_published", "observation_published")}
+            by_source = {}
+            for e in events:
+                if e["type"] == "assessment":
+                    by_source.setdefault(e["source_id"], []).append(e)
+            for source in ("pole2", "pole3"):
+                self.assertTrue(by_source[source])
+                for e in by_source[source]:
+                    self.assertEqual((e["state"], e["check_codes"]),
+                                     ("contested", ["CONTESTED"]))
+                    supporting = {published[ref]["source_id"] for ref in e["detail"]["supporting"]}
+                    self.assertEqual(supporting, {"pole2", "pole3"})
+                    self.assertTrue(e["detail"]["contradicting"])
+                    self.assertLessEqual(set(e["detail"]["contradicting"]), coverage_refs)
+            reflection_cell = list(cell)
+            snaps = [e for e in events if e["type"] == "map_snapshot"
+                     and reflection_cell in e["detail"]["contested"]]
+            self.assertTrue(snaps)
+            entry = next(c for c in snaps[-1]["detail"]["contested_claims"]
+                         if c["cell"] == reflection_cell)
+            kinds = {(published[ref]["source_id"], kind) for ref, kind in entry["claims"]}
+            self.assertIn(("lidar1", "free"), kinds)
+            self.assertIn(("pole2", "occupied"), kinds)
+            self.assertIn(("pole3", "occupied"), kinds)
+            self.assertIn("pole2", S2_NODES)
+            self.assertIn("pole3", S2_NODES)
 
 if __name__ == "__main__":
     unittest.main()

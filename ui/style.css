@@ -58,7 +58,7 @@ button { background: var(--accent); color: #041018; border: 0; border-radius: 6p
 
 .nodes { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
 .node { border: 1px solid var(--line); border-radius: 8px; padding: 8px; display: flex; justify-content: space-between; }
-.node.pole1 { border-left: 4px solid var(--pole); }
+.node.pole1, .node.pole2, .node.pole3 { border-left: 4px solid var(--pole); }
 .node.car1 { border-left: 4px solid var(--car); }
 .node.ego { border-left: 4px solid var(--ego); }
 .node.lidar1 { border-left: 4px solid var(--lidar); }
@@ -96,6 +96,10 @@ tbody tr.muted { color: var(--muted); cursor: default; }
 .swatch.contested { background: repeating-linear-gradient(45deg, var(--contested), var(--contested) 3px, #7c4a0a 3px, #7c4a0a 6px); }
 .map-info { margin: 6px 0 0; color: var(--muted); }
 .hint { margin: 0 0 8px; color: var(--muted); }
+.reasoner-panel h3 { margin: 10px 0 4px; font-size: 11px; text-transform: uppercase; color: var(--muted); }
+.reasoner-panel p { margin: 0 0 4px; }
+.reasoner-panel .muted { color: var(--muted); }
+#s3-overlay { max-width: 100%; margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; }
 .evidence-list { list-style: none; margin: 0; padding: 0; }
 .evidence-list li { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .evidence-list button.link { background: none; color: var(--accent); padding: 0; font-weight: 500; text-decoration: underline; }
