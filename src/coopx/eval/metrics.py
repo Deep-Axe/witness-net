@@ -78,6 +78,47 @@ def occluded_scores(ticks: list[dict]) -> dict:
     }
 
 
+EVAL_RADIUS_M = 50.0  # scored region around the ego; V2X-Real annotates a finite range
+
+
+def score_frame(beliefs: list[dict], gt_objects: list[dict], *, center, radius_m: float = EVAL_RADIUS_M) -> dict:
+    """Score one decision against ALL labelled objects, one-to-one.
+
+    Hazards outside the region are counted, not scored. Inside it, beliefs are
+    associated greedily by distance to class-compatible GT within the match
+    radius; each GT object takes one true positive, further beliefs on an
+    already-matched object are duplicates (one object seen by several
+    observers), and the rest are false hazards.
+    """
+    center = _xy(center)
+    hazards = [b for b in beliefs if _hazard(b)]
+    inside = [b for b in hazards if _dist(_xy(b["xy"]), center) <= radius_m]
+    gts = [g for g in gt_objects if _dist(_xy(g["xy"]), center) <= radius_m + VEHICLE_MATCH_M]
+    pairs = sorted((_dist(_xy(b["xy"]), _xy(g["xy"])), bi, gi)
+                   for bi, b in enumerate(inside) for gi, g in enumerate(gts) if _matches(b, g))
+    used_b, used_g = set(), set()
+    for _d, bi, gi in pairs:
+        if bi in used_b or gi in used_g:
+            continue
+        used_b.add(bi)
+        used_g.add(gi)
+    duplicates = sum(1 for bi, b in enumerate(inside) if bi not in used_b
+                     and any(_matches(b, gts[gi]) for gi in used_g))
+    true_positives = len(used_b)
+    return {"hazards": len(inside), "true_positives": true_positives, "duplicates": duplicates,
+            "false_hazards": len(inside) - true_positives - duplicates,
+            "out_of_region": len(hazards) - len(inside), "gt_in_region": len(gts)}
+
+
+def aggregate_frames(frames: list[dict]) -> dict:
+    keys = ("hazards", "true_positives", "duplicates", "false_hazards", "out_of_region")
+    total = {k: sum(f[k] for f in frames) for k in keys}
+    scored = total["true_positives"] + total["false_hazards"]
+    total["precision"] = None if scored == 0 else total["true_positives"] / scored
+    total["decisions"] = len(frames)
+    return total
+
+
 def warning_lead_us(first_match_us, first_ego_visible_us, latency_chain_us: int):
     """Lead time of a fast-path warning before ego can see the target.
 

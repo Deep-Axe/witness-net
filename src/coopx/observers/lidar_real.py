@@ -156,6 +156,78 @@ def lidar_coverage(frame, spec: GridSpec, *, capture_us, window_us,
                            frozenset(free|occupied),frozenset(free),frozenset(occupied))
 
 
+REL_BAND_M = (.2, 1.)   # above ground: any standing person blocks a ray here
+SLICE_M = .25           # ground-height slice per message on sloped sites
+
+
+def lidar_coverage_sliced(frame, spec: GridSpec, *, capture_us, window_us, max_range_m,
+                          rel_band_m=REL_BAND_M, slice_m=SLICE_M, min_size_m=.3):
+    """Ground-relative free space, published as absolute-band slices.
+
+    One absolute height band cannot be right across sloped ground (V2X-Real
+    scenario 2023-03-17-16-10-12_1_1 falls ~1.6 m over 35 m). Rays are clipped
+    once in height above this unit's own fitted ground plane (exact for straight
+    rays over a planar ground). Cells are then grouped by their ground height
+    into `slice_m` slices; each slice becomes one CoverageContent whose absolute
+    band (lo+slice+rel_lo, lo+rel_hi) lies INSIDE the band every one of its
+    cells was actually observed in, so no message claims more than was seen.
+    Without a ground plane: no free claims (silence is not free space).
+    """
+    if (not isinstance(spec, GridSpec) or not math.isfinite(max_range_m) or max_range_m <= 0
+            or type(capture_us) is not int or window_us[1] != capture_us
+            or not 0 < slice_m < rel_band_m[1] - rel_band_m[0]):
+        raise ValueError('invalid sliced coverage request')
+    points = own_points(frame); origin = frame.lidar_to_site[:3, 3]
+    plane = ground_model(frame, points)
+    if plane is None:
+        return []
+    ground = lambda xy: xy @ plane[:2] + plane[2]
+    rel = points.copy(); rel[:, 2] = points[:, 2] - ground(points[:, :2])
+    rel_origin = origin.copy(); rel_origin[2] = origin[2] - float(ground(origin[:2]))
+    offset = rel - rel_origin; distance = np.linalg.norm(offset[:, :2], axis=1)
+    keep = distance > 1e-6
+    rel, offset, distance, points = rel[keep], offset[keep], distance[keep], points[keep]
+    lower, upper = rel_band_m
+    in_range = distance <= max_range_m
+    ij = np.floor((points[in_range, :2] - [spec.origin_x, spec.origin_y]) / spec.cell_m).astype(np.int64)
+    inside = (ij[:, 0] >= 0) & (ij[:, 0] < spec.nx) & (ij[:, 1] >= 0) & (ij[:, 1] < spec.ny)
+    hit_cells = {tuple(map(int, c)) for c in ij[inside]}
+    h = rel[in_range, 2]
+    occupied = {tuple(map(int, c)) for c in ij[inside & (h > GROUND_MARGIN_M) & (h >= lower) & (h <= upper)]}
+    t0 = np.zeros(len(rel)); t1 = np.minimum(1., max_range_m / distance)
+    moving = np.abs(offset[:, 2]) >= 1e-12
+    u = np.divide(lower - rel_origin[2], offset[:, 2], out=np.full(len(rel), -math.inf), where=moving)
+    v = np.divide(upper - rel_origin[2], offset[:, 2], out=np.full(len(rel), math.inf), where=moving)
+    t0 = np.maximum(t0, np.minimum(u, v)); t1 = np.minimum(t1, np.maximum(u, v))
+    valid = (t0 < t1) & (moving | ((lower <= rel_origin[2]) & (rel_origin[2] <= upper)))
+    starts = rel_origin[:2] + offset[valid, :2] * t0[valid, None]
+    ends = rel_origin[:2] + offset[valid, :2] * t1[valid, None]
+    free = _ray_cells_many(starts, ends, spec) - hit_cells
+    observed = free | occupied
+    groups = defaultdict(lambda: (set(), set()))
+    for cell in observed:
+        g = float(ground(np.array(spec.cell_centre(cell))))
+        groups[math.floor(g / slice_m)][0 if cell in free else 1].add(cell)
+    out = []
+    for k in sorted(groups):
+        f_cells, o_cells = groups[k]
+        lo = k * slice_m
+        band = (lo + slice_m + lower, lo + upper)
+        out.append(CoverageContent(spec, window_us, 'lidar', band, min_size_m,
+                                   frozenset(f_cells | o_cells), frozenset(f_cells), frozenset(o_cells)))
+    return out
+
+
+def ground_band(frame, xy, *, rel_band_m=REL_BAND_M, slice_m=SLICE_M):
+    """The absolute band a slice message uses for the cell containing xy."""
+    plane = ground_model(frame)
+    if plane is None:
+        return None
+    g = float(plane[0] * xy[0] + plane[1] * xy[1] + plane[2])
+    lo = math.floor(g / slice_m) * slice_m
+    return (lo + slice_m + rel_band_m[0], lo + rel_band_m[1])
+
+
 def lidar_objects(frame, *, height_band_m=(.2,2.)):
     points=own_points(frame);plane=ground_model(frame,points)
     if plane is None:return []

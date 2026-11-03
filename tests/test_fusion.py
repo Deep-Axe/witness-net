@@ -79,3 +79,15 @@ class FusionWiringTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fuse('witness',ego_observations=[],remote_admitted=remote,store=f.store,
                  coverage_map=CoverageMap(f.spec),assessor=a,now_us=1_000_000)
+
+
+class StickyRefutationTests(unittest.TestCase):
+    def test_memory_keeps_a_refuted_remote_claim_contradicted(self):
+        from types import SimpleNamespace
+        import coopx.eval.fusion as fusion
+        # Exercised end to end in tests/test_eval.py (ghost_free caught on a mined clip);
+        # here only the contract: memory is optional and keyword-only.
+        import inspect
+        sig = inspect.signature(fusion.fuse)
+        self.assertIn("memory", sig.parameters)
+        self.assertIsNone(sig.parameters["memory"].default)

@@ -114,7 +114,7 @@ def main() -> None:
     s3.add_argument("--key-seed", type=int, default=0)
     s3.add_argument("--budget-usd", type=float, default=3.0)
     evaluate = sub.add_parser("eval", help="S4a: fusion x attack metrics, Muse off")
-    evaluate.add_argument("--scene", default="frame-000096")
+    evaluate.add_argument("--scene", default="all")
     evaluate.add_argument("--fusion", default="witness",
                           choices=("ego", "union", "geo", "witness", "all"))
     evaluate.add_argument("--attack", default=None)

@@ -97,12 +97,12 @@ def plan_attack(kind: str, *, seed: int, scene: dict, now_us: int,
         # Absence: "nothing is here", not another object. Unanchored peers have
         # no physical body at the target, so they cannot have seen it.
         "majority_veto": lambda: _free_peers(
-            "veto", VETO_K, target, now_us, seed, scene_grid((target, ego_local)),
-            TrustClass.B, False),
+            "veto", VETO_K, target, now_us, seed, (scene.get("grid") or scene_grid((target, ego_local))),
+            TrustClass.B, False, scene.get("height_band_m") or (0.2, 2.0)),
         # One remote lidar claim that the ego detection's cell is empty.
         "remote_clear": lambda: _free_peers(
-            "clear", 1, ego_local, now_us, seed, scene_grid((target, ego_local)),
-            TrustClass.A, True),
+            "clear", 1, ego_local, now_us, seed, (scene.get("grid") or scene_grid((target, ego_local))),
+            TrustClass.A, True, scene.get("height_band_m") or (0.2, 2.0)),
         "relay_dup": lambda: _relays(target, now_us, seed),
     }
     nodes, packets = builders[kind]()
@@ -206,15 +206,19 @@ def _many(prefix, count, xyz, cls, now_us, seed, trust, anchored):
     return tuple(nodes), tuple(packets)
 
 
-def _free_peers(prefix, count, xyz, now_us, seed, spec, trust, anchored):
-    """Signed lidar coverage: the cell under xyz is observed and free."""
+def _free_peers(prefix, count, xyz, now_us, seed, spec, trust, anchored, band=(0.2, 2.0)):
+    """Signed lidar coverage: the cell under xyz is observed and free.
+
+    `band` must be the same absolute height band honest range observers use
+    there (ground-relative), or the claim cannot apply to real detections.
+    """
     cell = spec.cell_at(xyz[0], xyz[1])
     nodes, packets = [], []
     for index in range(count):
         name = prefix if count == 1 else f"{prefix}-{index}"
         nodes.append(AttackNode(name, trust, anchored))
         content = CoverageContent(
-            spec, (now_us, now_us), "lidar", (0.2, 2.0), 0.3,
+            spec, (now_us, now_us), "lidar", tuple(band), 0.3,
             frozenset({cell}), frozenset({cell}), frozenset())
         key = demo_node_key(seed, name)
         message_id = f"{name}-{seed}"

@@ -39,7 +39,12 @@ def _belief(message,local,state,refs):
                   local,state,tuple(sorted(set(refs))))
 
 
-def fuse(mode,*,ego_observations,remote_admitted,store,coverage_map,assessor,now_us):
+def fuse(mode,*,ego_observations,remote_admitted,store,coverage_map,assessor,now_us,memory=None):
+    """`memory` (optional dict, kept by the caller across decisions): a remote
+    claim once contradicted by time-compatible free space stays contradicted.
+    The map keeps only each slot's newest scan, so without memory the refuting
+    scan is superseded and a stale claim would look merely unverified again.
+    Local (ego) beliefs are never contradicted or removed."""
     if mode not in FUSION_MODES:raise ValueError('unknown fusion mode')
     if type(now_us) is not int or now_us<0:raise ValueError('invalid fusion time')
     if assessor is None:
@@ -61,7 +66,16 @@ def fuse(mode,*,ego_observations,remote_admitted,store,coverage_map,assessor,now
             old=result.get(m.observation.key)
             if old is None or m.envelope.capture_time_us>old.envelope.capture_time_us:result[m.observation.key]=m
         return list(result.values())
-    local,remote=latest(local),latest(remote)
+    # A per-frame detector has no tracker: object ids are not stable across
+    # frames, so a source's newer frame supersedes its older detections (the
+    # camera's current view). Same rule for ego and remote sources.
+    def current_frame(messages):
+        newest={}
+        for m in messages:
+            src=m.envelope.source_id
+            newest[src]=max(newest.get(src,-1),m.envelope.capture_time_us)
+        return [m for m in messages if m.envelope.capture_time_us==newest[m.envelope.source_id]]
+    local,remote=current_frame(latest(local)),current_frame(latest(remote))
     if mode=='ego':return [_belief(m,True,'confirmed',[evidence_ref(m)]) for m in local]
     messages=local+remote
     for message in messages:store.add(message)
@@ -99,5 +113,9 @@ def fuse(mode,*,ego_observations,remote_admitted,store,coverage_map,assessor,now
             conflict=bool(cells) and len(free)/denominator>=FREE_FRACTION
             state='contradicted' if conflict else 'confirmed' if len(bodies)>=MIN_WITNESSES else 'unverified'
             refs=(*refs,*free_refs)
+        if memory is not None and not is_local and mode in ('geo','witness'):
+            refuted=memory.setdefault('refuted',set())
+            if state=='contradicted':refuted.add(ref)
+            elif ref in refuted:state='contradicted'
         result.append(_belief(m,is_local,state,refs))
     return result

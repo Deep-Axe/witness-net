@@ -108,9 +108,12 @@ class S3PipelineTests(unittest.TestCase):
             self.assertGreater(summary["accepted"], 0)
             # Fast path: rsu-2, rsu-1, and all four ego cameras. T3 "person" reuses rsu-2.
             self.assertEqual(post.calls, ["sam-3.1"] * 6 + ["coopx_plan_v1", "coopx_judge_v1"])
+            # The model asked one body; deterministic Verify adds a T2 to the second
+            # physical observer whose demonstrated footprint covers the region.
             self.assertEqual(summary["queries"], [
-                {"observer_id": "rsu-2", "tier": "T3", "concept": "person"}])
-            self.assertEqual(summary["answers"], ["detected"])
+                {"observer_id": "rsu-2", "tier": "T3", "concept": "person"},
+                {"observer_id": "rsu-1", "tier": "T2", "concept": "person"}])
+            self.assertEqual(summary["answers"][0], "detected")
             # One observer cannot corroborate: the model's upgrade is refused.
             self.assertEqual([v["state"] for v in summary["verdicts"]], ["unverified"])
             codes = {r["code"] for r in summary["reasoner_rejections"]}

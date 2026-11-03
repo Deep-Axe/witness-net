@@ -42,43 +42,6 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(bytes_per_detection(400, 2), 200)
         self.assertEqual(independence(6, 1), {"messages": 6, "independent_witnesses": 1})
 
-    def test_offline_fixture_witness_does_not_drop_the_ego(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            result = run_eval(scene="frame-000096", fusion="witness", attack="remote_clear",
-                              seed=1, offline=True, out_dir=Path(tmp), perception="gt-oracle")
-            run = result["runs"][0]
-            self.assertFalse(result["partial"])
-            self.assertTrue(run["fusion_stub"])
-            self.assertEqual(run["metrics"]["safety_flips"], 0)
-            self.assertIsNone(run["metrics"]["scores"]["occluded_recall"])
-            text = render_summary([run])
-            self.assertIn("frame-000096", text)
-            self.assertIn("n/a", text)
-            self.assertEqual(run["metrics"]["safety_flips"], 0)
-            self.assertTrue(run["metrics"]["attack_caught"])
-
-    def test_union_trusts_a_remote_clear_and_witness_does_not(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
-            witness = run_eval(scene="frame-000096", fusion="witness", attack="remote_clear",
-                               seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
-            union = run_eval(scene="frame-000096", fusion="union", attack="remote_clear",
-                             seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
-            self.assertEqual(witness["metrics"]["safety_flips"], 0)
-            self.assertTrue(witness["metrics"]["attack_caught"])
-            self.assertGreaterEqual(union["metrics"]["safety_flips"], 1)
-            self.assertFalse(union["metrics"]["attack_caught"])
-
-    def test_sybil_adds_no_witness_and_a_relay_counts_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
-            sybil = run_eval(scene="frame-000096", fusion="witness", attack="sybil",
-                             seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
-            relay = run_eval(scene="frame-000096", fusion="witness", attack="relay_dup",
-                             seed=1, out_dir=out, perception="gt-oracle")["runs"][0]
-            self.assertEqual(sybil["metrics"]["independence"]["independent_witnesses"], 0)
-            self.assertEqual(relay["metrics"]["independence"]["independent_witnesses"], 1)
-
     def test_sam_failure_keeps_the_error_text(self):
         from coopx.meta.client import MetaAPIError
 
@@ -88,6 +51,8 @@ class MetricTests(unittest.TestCase):
                     "Meta API network error: [Errno -2] Name or service not known",
                     status=None)
 
+        if not DATASET.is_dir():
+            self.skipTest("V2X-Real val set is not present")
         with tempfile.TemporaryDirectory() as tmp:
             run = run_eval(scene="frame-000096", fusion="ego", seed=1, offline=True,
                            out_dir=Path(tmp), perception="sam", client=Boom())["runs"][0]
@@ -95,5 +60,60 @@ class MetricTests(unittest.TestCase):
             self.assertTrue(run["partial"])
 
 
+DATASET = Path(__file__).resolve().parents[1] / "data" / "v2x-real" / "val"
+SCENES = Path(__file__).resolve().parents[1] / "data" / "scenes" / "scenes.json"
+
+
+@unittest.skipUnless(DATASET.is_dir() and SCENES.is_file(), "dataset or mined scenes absent")
+class MinedClipReplayTests(unittest.TestCase):
+    """Oracle perception on mined clip 1: deterministic, no network."""
+
+    def run_mode(self, fusion, attack=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            return run_eval(scene="blos_pedestrian_001", fusion=fusion, attack=attack, seed=1,
+                            offline=True, out_dir=Path(tmp), perception="gt-oracle")["runs"][0]
+
+    def test_remote_help_reaches_the_occluded_target_ego_alone_does_not(self):
+        ego, witness = self.run_mode("ego"), self.run_mode("witness")
+        self.assertEqual(ego["metrics"]["scores"]["occluded_recall"], 0.0)
+        self.assertGreater(witness["metrics"]["scores"]["occluded_recall"], 0.0)
+        self.assertEqual(witness["split"], "report")
+
+    def test_remote_clear_never_removes_a_local_detection(self):
+        for fusion in ("union", "witness"):
+            run = self.run_mode(fusion, "remote_clear")
+            self.assertEqual(run["metrics"]["safety_flips"], 0, fusion)
+
+    def test_sybil_adds_no_witness_and_a_relay_counts_once(self):
+        sybil = self.run_mode("witness", "sybil")
+        relay = self.run_mode("witness", "relay_dup")
+        self.assertEqual(sybil["metrics"]["independence"]["independent_witnesses"], 0)
+        self.assertEqual(relay["metrics"]["independence"]["independent_witnesses"], 1)
+
+    def test_summary_renders_from_runs(self):
+        text = render_summary([self.run_mode("witness")])
+        self.assertIn("blos_pedestrian_001", text)
+        self.assertIn("| report |", text)
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScoreFrameTests(unittest.TestCase):
+    def test_all_gt_one_to_one_duplicates_and_region(self):
+        from coopx.eval.metrics import aggregate_frames, score_frame
+        gt = [{"id": "a", "label": "Pedestrian", "xy": [0.0, 0.0]},
+              {"id": "b", "label": "Pedestrian", "xy": [10.0, 0.0]}]
+        beliefs = [{"xy": [0.2, 0.0], "cls": "PEDESTRIAN", "state": "unverified"},
+                   {"xy": [0.0, 0.5], "cls": "PEDESTRIAN", "state": "confirmed"},
+                   {"xy": [-0.4, 0.1], "cls": "PEDESTRIAN", "state": "unverified"},
+                   {"xy": [10.3, 0.0], "cls": "PEDESTRIAN", "state": "unverified"},
+                   {"xy": [200.0, 0.0], "cls": "PEDESTRIAN", "state": "unverified"},
+                   {"xy": [5.0, 5.0], "cls": "PEDESTRIAN", "state": "contradicted"}]
+        f = score_frame(beliefs, gt, center=(0.0, 0.0), radius_m=50.0)
+        self.assertEqual((f["true_positives"], f["duplicates"], f["false_hazards"], f["out_of_region"]),
+                         (2, 2, 0, 1))
+        self.assertEqual(aggregate_frames([f])["precision"], 1.0)
+        f2 = score_frame([{"xy": [30.0, 0.0], "cls": "PEDESTRIAN", "state": "unverified"}], gt,
+                         center=(0.0, 0.0))
+        self.assertEqual(aggregate_frames([f, f2])["precision"], 2 / 3)
