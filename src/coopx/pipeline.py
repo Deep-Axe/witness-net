@@ -54,6 +54,14 @@ S2_GHOST_SILENT_XYZ = (24.0, 15.2, 0.5)  # behind the parked truck along a lidar
 S2_REFLECTION_XYZ = (3.5, -12.5, 0.7)
 S2_REFLECTION_SOURCES = ("pole2", "pole3")
 S2_GRID = lidar_synth.S2_GRID
+# Calibrated S2 map poses (site frame). Viewer falls back to its table for old logs.
+S2_MAP_OBSERVERS = [
+    {"id": "lidar1", "xy": [float(S2_LIDAR_POSE[0]), float(S2_LIDAR_POSE[1])]},
+    {"id": "pole1", "xy": [float(S2_POLE_POSE[0]), float(S2_POLE_POSE[1])]},
+    {"id": "pole2", "xy": [-2.0, -8.0]},
+    {"id": "pole3", "xy": [2.0, -8.0]},
+    {"id": "ego", "xy": [-2.0, -2.0]},
+]
 
 
 class PassThroughChecker:
@@ -128,7 +136,58 @@ def _pose(source: str, frame: int) -> tuple[ObjectClass, tuple[float, float, flo
     return ObjectClass.VEHICLE, (12.0 + 6.0 * t_s, 4.0, 0.8), (6.0, 0.0, 0.0)
 
 
-def _check_event(delivery: PacketDelivery, result: CheckResult, now_us: int) -> dict:
+def _result_mode(result, fallback: str) -> str:
+    mode = getattr(result, "mode", None)
+    return mode if mode in ("live", "snapshot") else fallback
+
+
+def admit_packet(checker, raw: bytes, now_us: int, *, scene_time_us: int | None = None):
+    """Live admission, or snapshot admission for Q&A packets (contract 11).
+
+    Prefers `Checker.check(..., scene_time_us=)` when Agent A has landed it.
+    Until then a local stub judges freshness against the asked scene; expiry,
+    signature, duplicate and replay still go through the Checker. Snapshot
+    admissions must never feed the Assessor or coverage map.
+    """
+    if scene_time_us is None:
+        result = checker.check(raw, now_us)
+        return result, _result_mode(result, "live")
+    try:
+        result = checker.check(raw, now_us, scene_time_us=scene_time_us)
+        return result, _result_mode(result, "snapshot")
+    except TypeError:
+        pass
+    try:
+        message = decode(raw)
+        envelope = message.envelope
+    except (ValueError, TypeError):
+        return checker.check(raw, now_us), "snapshot"
+    extra = []
+    ttl = getattr(checker, "ttl_us", S3_TTL_US)
+    if abs(envelope.capture_time_us - scene_time_us) > ttl:
+        extra.append("STALE")
+    if now_us > envelope.valid_until_us:
+        extra.append("EXPIRED")
+    if extra:
+        return CheckResult(tuple(extra), "rejected", message), "snapshot"
+    saved_ttl = getattr(checker, "ttl_us", None)
+    saved_future = getattr(checker, "future_tolerance_us", None)
+    try:
+        if saved_ttl is not None:
+            checker.ttl_us = 10 ** 15
+        if saved_future is not None:
+            checker.future_tolerance_us = 10 ** 15
+        result = checker.check(raw, now_us)
+    finally:
+        if saved_ttl is not None:
+            checker.ttl_us = saved_ttl
+        if saved_future is not None:
+            checker.future_tolerance_us = saved_future
+    return result, _result_mode(result, "snapshot")
+
+
+def _check_event(delivery: PacketDelivery, result: CheckResult, now_us: int,
+                 *, mode: str = "live") -> dict:
     message = result.message
     envelope = None if message is None else message.envelope
     detail = {}
@@ -142,6 +201,7 @@ def _check_event(delivery: PacketDelivery, result: CheckResult, now_us: int) -> 
         detail = {"sensor_seq": envelope.sensor_seq}
     if delivery.tx_id is not None:
         detail["tx_id"] = delivery.tx_id
+    detail["mode"] = mode if mode in ("live", "snapshot") else "live"
     return make_event(
         t_replay_us=now_us, type="check",
         source_id=delivery.source, dest_id=delivery.receiver,
@@ -265,7 +325,8 @@ def _assessment_event(message: ObservationMessage, assessment: Assessment,
         detail=detail)
 
 
-def _map_snapshot_event(coverage_map: CoverageMap, now_us: int) -> dict:
+def _map_snapshot_event(coverage_map: CoverageMap, now_us: int,
+                        observers: list[dict] | None = None) -> dict:
     """Ego map at a tick, plus the per-source claims behind every contested cell."""
     detail = dict(coverage_map.snapshot(now_us))
     detail["contested_claims"] = [
@@ -274,6 +335,8 @@ def _map_snapshot_event(coverage_map: CoverageMap, now_us: int) -> dict:
         for cell in detail["contested"]]
     if not _is_default_s2_grid(coverage_map.spec):
         detail["grid"] = _grid_dict(coverage_map.spec)
+    if observers:
+        detail["observers"] = observers
     return make_event(t_replay_us=now_us, type="map_snapshot", source_id="ego", detail=detail)
 
 
@@ -445,7 +508,7 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
     for frame, sim_us in enumerate(range(0, S2_DURATION_US, S2_DT_US)):
         transport.receive_until(sim_us)
-        events.append(_map_snapshot_event(coverage_map, sim_us))
+        events.append(_map_snapshot_event(coverage_map, sim_us, S2_MAP_OBSERVERS))
 
         cls, xyz, velocity = _pose("pole1", frame)
         publish_observation("pole1", 1, frame, sim_us, cls, xyz, velocity)
@@ -481,7 +544,7 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
     drain_us = (S2_DURATION_US - S2_DT_US) + delay_us + jitter_us
     transport.receive_until(drain_us)
-    events.append(_map_snapshot_event(coverage_map, drain_us))
+    events.append(_map_snapshot_event(coverage_map, drain_us, S2_MAP_OBSERVERS))
     events[:] = _write_events(output, events, overwrite=overwrite)
 
     by_type = Counter(event["type"] for event in events)
@@ -515,8 +578,15 @@ S3_EGO = "2"
 S3_NODES = ("rsu-2", "rsu-1", "ego")
 S3_SESSION = "s3"
 S3_TTL_US = 5_000_000
-S3_DATASET = Path(__file__).resolve().parents[2] / "data" / "v2x-real" / "val"
+def _default_s3_dataset() -> Path:
+    here = Path(__file__).resolve().parents[2] / "data" / "v2x-real" / "val"
+    shared = Path("/home/deep/meta_hackathon/data/v2x-real/val")
+    return here if here.is_dir() else shared
+
+
+S3_DATASET = _default_s3_dataset()
 S3_OVERLAY = Path("data/s3/overlay.png")
+S3_PICK_PATH = Path("data/s3/pick.json")
 S3_REGION = (-1000.0, -1000.0, -50.0, 1000.0, 1000.0, 80.0)
 _S3_PICK_CACHE = {}
 
@@ -533,15 +603,76 @@ class S3FramePick:
     other_rsu_id: str
 
 
+# Verified: frame 000096, pedestrian 53 in RSU -2 cam2 and RSU -1 cam1.
+S3_FIXED_PICK = S3FramePick(
+    S3_SCENARIO, "000096", S3_RSU, S3_EGO, "cam2", "53", "cam1", S3_RSU_NEAR)
+
+
+def _pick_fingerprint(dataset_root: Path, scenario: str) -> str:
+    root = Path(dataset_root).resolve()
+    sentinel = root / scenario / S3_RSU / "000096.yaml"
+    if sentinel.is_file():
+        st = sentinel.stat()
+        return f"{root}|{scenario}|{st.st_size}|{int(st.st_mtime)}"
+    return f"{root}|{scenario}"
+
+
+def _verify_s3_pick(dataset, pick: S3FramePick) -> bool:
+    from coopx.dataset.v2xreal import box_fully_in_camera
+    try:
+        rsu = dataset.read(pick.scenario, pick.rsu_id, pick.frame_id)
+        box = rsu.boxes[pick.pedestrian_id]
+    except (KeyError, FileNotFoundError, OSError, ValueError):
+        return False
+    return (box.label.lower() == "pedestrian"
+            and pick.camera_name in rsu.cameras
+            and box_fully_in_camera(rsu, box, pick.camera_name))
+
+
+def _store_s3_pick(path: Path, fingerprint: str, pick: S3FramePick) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({
+        "fingerprint": fingerprint,
+        "pick": {
+            "scenario": pick.scenario, "frame_id": pick.frame_id, "rsu_id": pick.rsu_id,
+            "ego_id": pick.ego_id, "camera_name": pick.camera_name,
+            "pedestrian_id": pick.pedestrian_id, "other_camera": pick.other_camera,
+            "other_rsu_id": pick.other_rsu_id,
+        },
+    }, separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def pick_s3_frame(dataset_root: Path = S3_DATASET, *,
                   scenario: str = S3_SCENARIO, rsu_id: str = S3_RSU,
                   ego_id: str = S3_EGO) -> S3FramePick:
-    """Deterministic first frame with a fully-visible RSU pedestrian."""
-    cache_key = (str(dataset_root), scenario, rsu_id, ego_id)
+    """Deterministic first frame with a fully-visible RSU pedestrian.
+
+    Cheap path: in-process cache, then data/s3/pick.json, then the verified
+    fixed frame. Full dataset scan only if those fail.
+    """
+    cache_key = (str(Path(dataset_root).resolve()), scenario, rsu_id, ego_id)
     if cache_key in _S3_PICK_CACHE:
         return _S3_PICK_CACHE[cache_key]
     from coopx.dataset.v2xreal import (V2XReal, box_fully_in_camera, count_lidar_in_box)
     dataset = V2XReal(dataset_root)
+    fingerprint = _pick_fingerprint(dataset_root, scenario)
+    if S3_PICK_PATH.is_file():
+        try:
+            data = json.loads(S3_PICK_PATH.read_text(encoding="utf-8"))
+            if data.get("fingerprint") == fingerprint:
+                pick = S3FramePick(**data["pick"])
+                if _verify_s3_pick(dataset, pick):
+                    _S3_PICK_CACHE[cache_key] = pick
+                    return pick
+        except (ValueError, TypeError, KeyError, OSError):
+            pass
+    if (scenario, rsu_id, ego_id) == (S3_SCENARIO, S3_RSU, S3_EGO) and _verify_s3_pick(
+            dataset, S3_FIXED_PICK):
+        _store_s3_pick(S3_PICK_PATH, fingerprint, S3_FIXED_PICK)
+        _S3_PICK_CACHE[cache_key] = S3_FIXED_PICK
+        return S3_FIXED_PICK
     frame_ids = dataset.aligned_frame_ids(scenario, (rsu_id, ego_id, S3_RSU_NEAR))
     if not frame_ids:
         frame_ids = dataset.aligned_frame_ids(scenario, (rsu_id, ego_id))
@@ -565,19 +696,23 @@ def pick_s3_frame(dataset_root: Path = S3_DATASET, *,
                     box_fully_in_camera(ego, box, ego_cam) for ego_cam in ego.cameras)
                 pick = S3FramePick(
                     scenario, frame_id, rsu_id, ego_id, camera_name, box.object_id,
-                    sorted(rsu.cameras)[0] if sorted(rsu.cameras)[0] != camera_name
-                    else (sorted(rsu.cameras)[1] if len(rsu.cameras) > 1 else camera_name),
-                    S3_RSU_NEAR)
+                    "cam1", S3_RSU_NEAR)
                 if hidden_from_ego:
-                    _S3_PICK_CACHE[cache_key] = pick
-                    return pick
+                    preferred = pick
+                    break
                 if fallback is None:
                     fallback = pick
-    if fallback is not None:
-        _S3_PICK_CACHE[cache_key] = fallback
-        return fallback
-    raise FileNotFoundError(
-        f"no S3 pedestrian frame in {scenario} rsu={rsu_id} ego={ego_id}")
+            if preferred is not None:
+                break
+        if preferred is not None:
+            break
+    pick = preferred or fallback
+    if pick is None:
+        raise FileNotFoundError(
+            f"no S3 pedestrian frame in {scenario} rsu={rsu_id} ego={ego_id}")
+    _store_s3_pick(S3_PICK_PATH, fingerprint, pick)
+    _S3_PICK_CACHE[cache_key] = pick
+    return pick
 
 
 def _scene_grid(points_xy, *, cell_m=1.0, pad=15.0) -> GridSpec:
@@ -597,6 +732,10 @@ def _write_s3_overlay(path: Path, frame, camera_name: str, detections, gt_box) -
     image = Image.open(frame.cameras[camera_name].image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
     for detection in detections:
+        if getattr(detection, "mask", None) is not None:
+            ys, xs = detection.mask.nonzero()
+            if len(xs):
+                draw.point(list(zip(xs.tolist(), ys.tolist())), fill=(0, 220, 80))
         draw.rectangle(detection.box_xyxy, outline=(0, 220, 80), width=3)
     if gt_box is not None:
         uv, _depth, valid = project_camera(
@@ -622,7 +761,8 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     every model result enters the log at its availability time.
     """
     _require_output(output, overwrite)
-    from coopx.dataset.v2xreal import V2XReal, camera_footprint_xy, point_in_polygon
+    from coopx.dataset.v2xreal import (V2XReal, box_fully_in_camera,
+                                       camera_footprint_xy, point_in_polygon)
     from coopx.envelope import encode, evidence_ref
     from coopx.meta.client import (BudgetExceeded, CacheMiss, MetaAPIError, MetaClient,
                                    model_call_event)
@@ -640,22 +780,37 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     pedestrian = rsu.boxes[pick.pedestrian_id]
     center = tuple(float(v) for v in pedestrian.center_site())
 
-    cap_rsu = rsu_camera_capability("rsu-2", rsu, pick.camera_name)
-    other_cam = None
+    other_box = other.boxes.get(pick.pedestrian_id)
+    covering_cam, gap_cam = None, None
     for name in sorted(other.cameras):
-        if not point_in_polygon(center[:2], camera_footprint_xy(other, name)):
-            other_cam = name
-            break
-    if other_cam is None:
-        other_cam = pick.other_camera if pick.other_camera in other.cameras else sorted(other.cameras)[0]
-    cap_other = rsu_camera_capability("rsu-1", other, other_cam)
-    capabilities = [cap_rsu, cap_other]
+        if other_box is not None:
+            inside = box_fully_in_camera(other, other_box, name)
+        else:
+            inside = point_in_polygon(center[:2], camera_footprint_xy(other, name))
+        if inside and covering_cam is None:
+            covering_cam = name
+        if not inside and gap_cam is None:
+            gap_cam = name
+    if covering_cam is None:
+        covering_cam = pick.other_camera if pick.other_camera in other.cameras else sorted(other.cameras)[0]
+    if gap_cam is None:
+        gap_cam = next((n for n in sorted(other.cameras) if n != covering_cam), covering_cam)
 
-    points = [
-        (float(rsu.lidar_to_site[0, 3]), float(rsu.lidar_to_site[1, 3])),
-        (float(ego.lidar_to_site[0, 3]), float(ego.lidar_to_site[1, 3])),
-        center[:2],
+    cap_rsu2 = rsu_camera_capability("rsu-2", rsu, pick.camera_name)
+    cap_rsu1 = rsu_camera_capability("rsu-1", other, covering_cam)
+    cap_rsu1b = rsu_camera_capability("rsu-1b", other, gap_cam)
+    capabilities = [cap_rsu2, cap_rsu1, cap_rsu1b]
+
+    def _xy(frame) -> list[float]:
+        return [round(float(frame.lidar_to_site[0, 3]), 3),
+                round(float(frame.lidar_to_site[1, 3]), 3)]
+
+    map_observers = [
+        {"id": "rsu-2", "xy": _xy(rsu)},
+        {"id": "rsu-1", "xy": _xy(other)},
+        {"id": "ego", "xy": _xy(ego)},
     ]
+    points = [tuple(o["xy"]) for o in map_observers] + [center[:2]]
     grid = _scene_grid(points)
     keys, anchors = _anchors_and_keys(
         S3_NODES, key_seed=key_seed,
@@ -673,21 +828,26 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
     accepted = rejected = 0
     admitted: list = []
     accepted_refs: dict[str, ObservationMessage] = {}
+    snapshot_scene: dict[str, int] = {}
 
     def on_delivery(delivery: PacketDelivery) -> None:
         nonlocal accepted, rejected
         if delivery.receiver != "ego":
             return
         now_us = delivery.available_sim_us
-        result = checker.check(delivery.packet, now_us)
-        events.append(_check_event(delivery, result, now_us))
+        ref = delivery.evidence_ref or packet_hash(delivery.packet)
+        result, mode = admit_packet(
+            checker, delivery.packet, now_us, scene_time_us=snapshot_scene.get(ref))
+        events.append(_check_event(delivery, result, now_us, mode=mode))
         if result.state != "accepted":
             rejected += 1
             return
         accepted += 1
         if isinstance(result.message, ObservationMessage):
-            admitted.append(result.message)
             accepted_refs[evidence_ref(result.message)] = result.message
+            if mode == "snapshot":
+                return
+            admitted.append(result.message)
             assessment = assessor.assess(result.message, now_us)
             events.append(_assessment_event(
                 result.message, assessment, delivery.evidence_ref, now_us,
@@ -697,18 +857,24 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         S3_NODES, delay_us=delay_us, jitter_us=0, loss_probability=0.0,
         seed=0, event_callback=events.append, delivery_callback=on_delivery)
 
-    def frame_source():
-        return jpeg_to_camera_frame(rsu, pick.camera_name)
+    def make_observer(observer_id, agent_frame, camera_name):
+        return CameraObserver(
+            observer_id,
+            lambda f=agent_frame, c=camera_name: jpeg_to_camera_frame(f, c),
+            camera_name, client, lift_box, keys[observer_id],
+            session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_query)
 
-    observer = CameraObserver(
-        "rsu-2", frame_source, pick.camera_name, client, lift_box, keys["rsu-2"],
-        session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_query)
+    observer_rsu2 = make_observer("rsu-2", rsu, pick.camera_name)
+    observer_rsu1 = make_observer("rsu-1", other, covering_cam)
+    cameras = {"rsu-2": observer_rsu2, "rsu-1": observer_rsu1}
     published_refs: dict[str, ObservationMessage] = {}
 
-    def publish_message(message) -> None:
+    def publish_message(message, *, scene_time_us: int | None = None) -> None:
         raw = encode(message)
         ref = evidence_ref(message)
         published_refs[ref] = message
+        if scene_time_us is not None:
+            snapshot_scene[ref] = scene_time_us
         events.append(make_event(
             t_replay_us=message.envelope.generation_time_us, type="observation_published",
             source_id=message.envelope.source_id, message_id=message.envelope.message_id,
@@ -720,18 +886,20 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
                        sim_us=message.envelope.generation_time_us,
                        message_id=message.envelope.message_id, message_type="observation")
 
-    # Fast path: SAM at the observer -> lift -> signed observations -> checker.
+    # Fast path: both RSUs SAM -> lift -> signed observations -> live checker.
     capture_us = rsu.nominal_time_us
-    published = observer.observe()
-    events.extend(observer.drain_events())
     publish_us = capture_us
-    for message in published:
-        publish_message(message)
-        publish_us = max(publish_us, message.envelope.generation_time_us)
-    drain_us = max(publish_us, observer.last_result.availability_time_us
-                   if observer.last_result else publish_us) + delay_us
+    last_avail = capture_us
+    for obs in (observer_rsu2, observer_rsu1):
+        for message in obs.observe():
+            publish_message(message)
+            publish_us = max(publish_us, message.envelope.generation_time_us)
+        events.extend(obs.drain_events())
+        if obs.last_result:
+            last_avail = max(last_avail, obs.last_result.availability_time_us)
+    drain_us = max(publish_us, last_avail) + delay_us
     transport.receive_until(drain_us)
-    events.append(_map_snapshot_event(coverage_map, drain_us))
+    events.append(_map_snapshot_event(coverage_map, drain_us, map_observers))
 
     # Supervisory path: question -> Spark plan -> execute -> answers -> Spark judge.
     t_q = drain_us
@@ -769,24 +937,32 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
 
     answer_times: dict[str, int] = {}
 
-    def call_rsu2(query):
+    caps = {"rsu-2": cap_rsu2, "rsu-1": cap_rsu1, "rsu-1b": cap_rsu1b}
+
+    def call_camera(observer_id, query):
+        observer = cameras[observer_id]
         before = len(observer.published)
         try:
-            answer, at_us = observer.on_query(query, cap_rsu, plan_avail)
+            answer, at_us = observer.on_query(query, caps[observer_id], plan_avail)
         except (MetaAPIError, CacheMiss, BudgetExceeded) as exc:
             raise ObserverUnavailable(type(exc).__name__) from exc
         for message in observer.published[before:]:
-            publish_message(message)
+            publish_message(message, scene_time_us=query.time_us)
         answer_times[query.query_id] = at_us
         return answer
 
-    def call_rsu1(query):
-        # rsu-1 shares nothing in this frame: it can only say not_covered/unavailable.
+    def call_rsu1b(query):
+        # Same physical observer as rsu-1, a camera that does not cover the region.
         answer_times[query.query_id] = plan_avail
-        return answer_query(query, cap_other, [], [], plan_avail)
+        return answer_query(query, cap_rsu1b, [], [], plan_avail)
 
-    raw_answers = execute(queries, capabilities, {"rsu-2": call_rsu2, "rsu-1": call_rsu1})
-    events.extend(observer.drain_events())
+    raw_answers = execute(queries, capabilities, {
+        "rsu-2": lambda q: call_camera("rsu-2", q),
+        "rsu-1": lambda q: call_camera("rsu-1", q),
+        "rsu-1b": call_rsu1b,
+    })
+    events.extend(observer_rsu2.drain_events())
+    events.extend(observer_rsu1.drain_events())
     answers_us = plan_avail
     for answer in raw_answers:
         answers_us = max(answers_us, answer_times.get(answer.query_id, plan_avail) + delay_us)
@@ -819,7 +995,8 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
             evidence[ref] = {
                 "source_id": message.envelope.source_id, "object_id": o.object_id,
                 "message_id": message.envelope.message_id, "class": o.cls.name,
-                "label": observer.labels.get(message.label_id) if message.label_id else None,
+                "label": (cameras.get(message.envelope.source_id).labels.get(message.label_id)
+                          if message.label_id and cameras.get(message.envelope.source_id) else None),
                 "xy": [round(o.xyz_m[0], 2), round(o.xyz_m[1], 2)],
                 "capture_time_us": message.envelope.capture_time_us,
                 "availability_time_us": message.envelope.generation_time_us,
@@ -830,7 +1007,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         events.append(verdict.to_event(judge_result.availability_time_us))
 
     try:
-        _write_s3_overlay(overlay, rsu, pick.camera_name, observer.fast_path_detections, pedestrian)
+        _write_s3_overlay(overlay, rsu, pick.camera_name, observer_rsu2.fast_path_detections, pedestrian)
     except OSError:
         pass
 
@@ -864,4 +1041,11 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         "verdicts": [{"subject": v.subject, "state": v.state, "refs": len(v.evidence_refs)}
                      for v in verdicts],
         "reasoner_rejections": list(reasoner.rejections),
+        "rsu2_published": len(observer_rsu2.published),
+        "rsu1_published": len(observer_rsu1.published),
+        "rsu1_camera": covering_cam,
+        "rsu1b_camera": gap_cam,
+        "snapshot_accepted": sum(
+            1 for e in events if e["type"] == "check"
+            and e["detail"].get("mode") == "snapshot" and e["state"] == "accepted"),
     }

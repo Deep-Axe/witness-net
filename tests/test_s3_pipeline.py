@@ -8,7 +8,7 @@ import unittest
 from coopx import events as event_schema
 from coopx.dataset.v2xreal import V2XReal, camera_image_size, project_camera
 from coopx.meta.client import MetaClient
-from coopx.pipeline import pick_s3_frame, run_s3
+from coopx.pipeline import S3_DATASET as DATASET, pick_s3_frame, run_s3
 
 
 class _FakeMeta:
@@ -18,8 +18,9 @@ class _FakeMeta:
     ref: both must be rejected by the Reasoner's candidate-set validation.
     """
 
-    def __init__(self, sam_text):
+    def __init__(self, sam_text, *, plan_concept="person"):
         self.sam_text = sam_text
+        self.plan_concept = plan_concept
         self.calls = []
 
     @staticmethod
@@ -38,7 +39,7 @@ class _FakeMeta:
             region = data["context"]["asked_region"]
             out = {"queries": [
                 {"tier": "T3", "observer_id": "rsu-2", "center_xy": region["center"],
-                 "radius_m": region["radius_m"], "concept": "person", "reason": "covers it"},
+                 "radius_m": region["radius_m"], "concept": self.plan_concept, "reason": "covers it"},
                 {"tier": "T1", "observer_id": "rsu-9", "center_xy": region["center"],
                  "radius_m": 4.0, "concept": None, "reason": "invented observer"}]}
         elif not data["evidence"]:
@@ -50,8 +51,6 @@ class _FakeMeta:
                                  "state": "corroborated",
                                  "evidence_refs": [ref, "f" * 64], "reason": "seen by rsu-2"}]}
         return _payload(json.dumps(out))
-
-DATASET = Path(__file__).resolve().parents[1] / "data" / "v2x-real" / "val"
 
 
 def _sam_text_for_gt(pick) -> str:
@@ -107,8 +106,8 @@ class S3PipelineTests(unittest.TestCase):
             self.assertGreater(counts.get("answer", 0), 0)
             self.assertGreater(counts.get("verdict", 0), 0)
             self.assertGreater(summary["accepted"], 0)
-            # One SAM call (the T3 rerun is a cache hit), one plan, one judge.
-            self.assertEqual(post.calls, ["sam-3.1", "coopx_plan_v1", "coopx_judge_v1"])
+            # Two SAM fast-path calls (rsu-2 and rsu-1); T3 "person" reuses rsu-2.
+            self.assertEqual(post.calls, ["sam-3.1", "sam-3.1", "coopx_plan_v1", "coopx_judge_v1"])
             self.assertEqual(summary["queries"], [
                 {"observer_id": "rsu-2", "tier": "T3", "concept": "person"}])
             self.assertEqual(summary["answers"], ["detected"])
@@ -122,11 +121,17 @@ class S3PipelineTests(unittest.TestCase):
             self.assertEqual(len(verdict["detail"]["model_call_ids"]), 2)
             sam_calls = [e for e in events if e["type"] == "model_call"
                          and e["detail"]["product"] == "sam-3.1"]
-            self.assertEqual(len(sam_calls), 1)  # T3 "person" reuses the fast path
+            self.assertEqual(len(sam_calls), 2)  # rsu-2 + rsu-1; T3 reuses rsu-2
             plan = next(e for e in events if e["type"] == "model_call"
                         and e["detail"]["stage"] == "plan")
             self.assertEqual(plan["detail"]["question"], summary["question"])
             self.assertEqual(summary["withheld_refs"], 0)
+            snaps = [e for e in events if e["type"] == "map_snapshot"]
+            self.assertTrue(snaps[-1]["detail"]["observers"])
+            ids = {o["id"] for o in snaps[-1]["detail"]["observers"]}
+            self.assertEqual(ids, {"rsu-2", "rsu-1", "ego"})
+            self.assertTrue(all(e["detail"].get("mode") == "live"
+                                for e in events if e["type"] == "check" and e["state"] == "accepted"))
 
             published_refs = {}
             seen_query = {}
@@ -191,6 +196,27 @@ class S3PipelineTests(unittest.TestCase):
                              ("unavailable", "detected"))
             self.assertTrue(answer["detail"]["withheld_refs"])
             self.assertEqual([v["state"] for v in summary["verdicts"]], ["unverified"])
+
+    def test_snapshot_t3_is_labelled_and_skips_the_assessor(self):
+        """A new-concept T3 after a slow SAM is snapshot-admitted, not a hazard."""
+        pick = pick_s3_frame(DATASET)
+        with tempfile.TemporaryDirectory() as tmp:
+            post = _FakeMeta(_sam_text_for_gt(pick), plan_concept="traffic cone")
+            path = Path(tmp) / "s3.jsonl"
+            summary = run_s3(path, client=self._client(tmp, post, latency_s=6.0),
+                             overwrite=True, overlay=Path(tmp) / "o.png", dataset_root=DATASET)
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+            snapshot = [e for e in events if e["type"] == "check"
+                        and e["detail"].get("mode") == "snapshot"]
+            self.assertTrue(snapshot)
+            self.assertTrue(all(e["state"] == "accepted" for e in snapshot))
+            snap_refs = {e["evidence_ref"] for e in snapshot}
+            assessed = {e["evidence_ref"] for e in events if e["type"] == "assessment"}
+            self.assertFalse(snap_refs & assessed)
+            self.assertGreater(summary["snapshot_accepted"], 0)
+            live_ok = [e for e in events if e["type"] == "check"
+                       and e["detail"].get("mode") == "live" and e["state"] == "accepted"]
+            self.assertEqual(live_ok, [])
 
     def test_existing_output_without_overwrite_spends_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

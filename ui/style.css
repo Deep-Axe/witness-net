@@ -80,6 +80,7 @@ th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line
 tbody tr { cursor: pointer; }
 tbody tr:hover, tbody tr.sel { background: #243140; }
 tbody tr.rejected { color: var(--bad); }
+tbody tr.snapshot td:last-child { color: var(--warn); }
 tbody tr.contradicted { color: var(--warn); background: #3a2a14; }
 tbody tr.contested { color: var(--contested); }
 tbody tr.muted { color: var(--muted); cursor: default; }

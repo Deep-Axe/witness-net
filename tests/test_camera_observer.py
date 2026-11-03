@@ -7,15 +7,17 @@ import numpy as np
 from PIL import Image
 import yaml
 
-from coopx.dataset.v2xreal import (V2XReal, camera_footprint_xy, point_in_polygon)
+from coopx.dataset.v2xreal import (V2XReal, box_fully_in_camera, camera_footprint_xy,
+                                   point_in_polygon)
 from coopx.domain import ObjectClass, PositionAnchor
 from coopx.envelope import evidence_ref
 from coopx.events import validate
+from coopx.meta.mask import encode_one_bit
 from coopx.observers.camera import CameraFrame, CameraObserver
 from coopx.observers.camera_lift import Lifted, lift_box
 from coopx.query import Capability, Query
 from coopx.meta.client import MetaClient
-from coopx.pipeline import demo_node_key
+from coopx.pipeline import S3_DATASET as DATASET, demo_node_key
 
 
 class _FakePost:
@@ -38,7 +40,6 @@ def _ok(text="hello", images=0):
         },
     }
 
-DATASET = Path(__file__).resolve().parents[1] / "data" / "v2x-real" / "val"
 SCENARIO = "2023-04-04-14-28-53_45_0"
 
 
@@ -95,6 +96,34 @@ class CameraObserverTests(unittest.TestCase):
             self.assertEqual(answer.result, "detected")
             self.assertIn(evidence_ref(messages[0]), answer.evidence_refs)
 
+    def test_lift_receives_mask_when_sam_returns_one(self):
+        raster = bytes([1] * 16)
+        payload = encode_one_bit(raster, 4, 4)
+        text = (f"<|box;x1=8;y1=8;x2=11;y2=11;w=32;h=32|>"
+                f"<|mask;x=0;y=0;data=4,4,{payload}|>")
+        with tempfile.TemporaryDirectory() as tmp:
+            post = _FakePost([_ok(text, images=1)])
+            client = MetaClient(
+                cache_dir=Path(tmp) / "c", cost_log=Path(tmp) / "cost.jsonl",
+                post=post, environ={"MODEL_API_KEY": "k"},
+                clock=iter([0.0, 0.1, 1.0, 1.0]).__next__)
+            seen = {}
+
+            def lift_fn(box, *_args, **kwargs):
+                seen["mask"] = kwargs.get("mask")
+                return Lifted((3.0, 4.0, 1.0), (0.6, 0.6, 1.6), (0.1, 0.1, 0.1),
+                              8, PositionAnchor.SURFACE)
+
+            class DummyFrame:
+                cameras = {"cam1": None}
+
+            observer = CameraObserver(
+                "rsu-2", lambda: CameraFrame(_tiny_png(), (32, 32), 1_000_000, DummyFrame(), "cam1"),
+                "cam1", client, lift_fn, demo_node_key(1, "rsu-2"), ttl_us=5_000_000)
+            self.assertEqual(len(observer.observe()), 1)
+            self.assertIsNotNone(seen.get("mask"))
+            self.assertEqual(seen["mask"].shape, (32, 32))
+
     def test_new_concepts_are_found_and_stay_distinct(self):
         with tempfile.TemporaryDirectory() as tmp:
             box = "<0f>0<|box;x1=8;y1=8;x2=24;y2=24;w=32;h=32|>"
@@ -148,7 +177,7 @@ class CameraObserverTests(unittest.TestCase):
 
 @unittest.skipUnless(DATASET.is_dir(), "V2X-Real val set is not present")
 class CameraCapabilityTests(unittest.TestCase):
-    def test_chosen_pedestrian_inside_rsu2_outside_rsu1(self):
+    def test_chosen_pedestrian_in_both_rsus_and_excluded_by_a_gap_camera(self):
         from coopx.pipeline import pick_s3_frame
         pick = pick_s3_frame(DATASET)
         dataset = V2XReal(DATASET)
@@ -156,18 +185,18 @@ class CameraCapabilityTests(unittest.TestCase):
         other = dataset.read(pick.scenario, pick.other_rsu_id, pick.frame_id)
         pedestrian = rsu.boxes[pick.pedestrian_id]
         xy = tuple(float(v) for v in pedestrian.center_site()[:2])
-        poly2 = camera_footprint_xy(rsu, pick.camera_name)
-        self.assertTrue(point_in_polygon(xy, poly2),
+        self.assertTrue(point_in_polygon(xy, camera_footprint_xy(rsu, pick.camera_name)),
                         f"pedestrian {pick.pedestrian_id} not in rsu-2 {pick.camera_name}")
-        outside = False
-        used = None
+        other_box = other.boxes.get(pick.pedestrian_id)
+        covering, gap = [], []
         for name in sorted(other.cameras):
-            if not point_in_polygon(xy, camera_footprint_xy(other, name)):
-                outside = True
-                used = name
-                break
-        self.assertTrue(outside, "no rsu-1 camera footprint excludes the pedestrian")
-        self.assertIsNotNone(used)
+            if other_box is not None:
+                inside = box_fully_in_camera(other, other_box, name)
+            else:
+                inside = point_in_polygon(xy, camera_footprint_xy(other, name))
+            (covering if inside else gap).append(name)
+        self.assertTrue(covering, "rsu-1 needs a camera that sees the pedestrian")
+        self.assertTrue(gap, "rsu-1 needs a camera that does not cover the region")
 
 
 if __name__ == "__main__":

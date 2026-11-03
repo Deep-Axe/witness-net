@@ -107,6 +107,9 @@ function validate(event, index) {
     const ok = event.check_codes.length === 1 && event.check_codes[0] === "OK";
     if (ok && event.state !== "accepted") return `line ${index}: accepted state`;
     if (!ok && event.state !== "rejected") return `line ${index}: rejected state`;
+    if (event.detail.mode != null && event.detail.mode !== "live" && event.detail.mode !== "snapshot") {
+      return `line ${index}: check mode`;
+    }
   } else if (event.type === "assessment") {
     if (!ASSESSMENT_STATES.has(event.state)) return `line ${index}: assessment state`;
     if (!event.check_codes.length || event.check_codes.some((c) => !ASSESSMENT_CODES.has(c))) {
@@ -304,6 +307,9 @@ function rowClass(event, idx) {
   const bits = [];
   if (idx === state.selected) bits.push("sel");
   if (event.type === "check" && event.state === "rejected") bits.push("rejected");
+  if (event.type === "check" && event.detail && event.detail.mode === "snapshot") bits.push("snapshot");
+  if (event.type === "answer" && event.detail && Array.isArray(event.detail.withheld_refs)
+      && event.detail.withheld_refs.length) bits.push("snapshot");
   if (event.type === "assessment" && event.state === "contradicted") bits.push("contradicted");
   if (event.type === "assessment" && event.state === "contested") bits.push("contested");
   return bits.join(" ");
@@ -372,7 +378,8 @@ function renderTable() {
       event.t_replay_us, event.type, event.source_id, event.dest_id ?? "",
       event.message_id ?? "", event.bytes ?? "",
       Array.isArray(event.check_codes) ? event.check_codes.join(",") : "",
-      event.state ?? "",
+      (event.state ?? "") + (event.detail && event.detail.mode === "snapshot"
+        ? " · snapshot Q&A — no timing claim" : ""),
     ]) {
       tr.appendChild(el("td", "", value === "" ? "" : String(value)));
     }
@@ -504,7 +511,15 @@ function renderMap() {
     const iy = (xy[1] - origin[1]) / cellM;
     return [ix * cw, canvas.height - iy * ch];
   }
-  for (const [id, pose] of Object.entries(POSES)) {
+  const poses = { ...POSES };
+  if (snap && Array.isArray(snap.detail.observers)) {
+    for (const entry of snap.detail.observers) {
+      if (entry && typeof entry.id === "string" && Array.isArray(entry.xy) && entry.xy.length === 2) {
+        poses[entry.id] = entry.xy;
+      }
+    }
+  }
+  for (const [id, pose] of Object.entries(poses)) {
     if (!nodeIds().includes(id) && id !== "lidar1" && id !== "pole1") continue;
     const [px, py] = toPx(pose);
     ctx.fillStyle = id.startsWith("ghost") ? "#fb923c" : (id === "lidar1" ? "#5eead4" : "#6cb6ff");
@@ -582,6 +597,10 @@ function renderReasoner() {
   host.appendChild(el("p", "", asked ? asked.detail.question : question
     ? (question.detail.reason || question.detail.concept || "region question")
     : "No query yet."));
+  const snapshot = evs.some((e) => e.type === "check" && e.detail && e.detail.mode === "snapshot");
+  if (snapshot) {
+    host.appendChild(el("p", "muted", "snapshot Q&A — no timing claim"));
+  }
   host.appendChild(el("h3", "", "Plan"));
   const queries = evs.filter((e) => e.type === "query");
   if (!queries.length) host.appendChild(el("p", "muted", "No planned queries."));

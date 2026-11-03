@@ -152,6 +152,9 @@ class S2PipelineTests(unittest.TestCase):
             self.assertGreater(counts["assessment"], 0)
             self.assertGreater(counts["map_snapshot"], 0)
             self.assertEqual(summary["events_by_type"], dict(counts))
+            snaps = [e for e in events if e["type"] == "map_snapshot"]
+            self.assertEqual({o["id"] for o in snaps[0]["detail"]["observers"]},
+                             {"lidar1", "pole1", "pole2", "pole3", "ego"})
             times = [e["t_replay_us"] for e in events]
             self.assertEqual(times, sorted(times))
 
