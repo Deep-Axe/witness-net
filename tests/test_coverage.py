@@ -247,9 +247,23 @@ class CoverageMapTests(unittest.TestCase):
     def test_unanchored_peer_and_class_d_cannot_turn_map_free(self):
         self.map.add(self.f.coverage(source='attacker', free={(3, 1)}), 1_000_000)
         self.assertEqual(self.map.snapshot(1_000_000)['free'], [])
-        self.f.store.anchors['other'] = replace(self.f.anchors['other'], trust_class=TrustClass.D)
+        self.f.store.replace_anchors({**self.f.store.anchors, 'other': replace(self.f.anchors['other'], trust_class=TrustClass.D)})
         self.map.add(self.f.coverage(source='other', free={(4, 1)}), 1_000_000)
         self.assertEqual(self.map.snapshot(1_000_000)['unknown_count'], 120)
+
+    def test_anchor_rotation_and_pruning_invalidate_free_evidence_caches(self):
+        message = self.f.coverage(free={(3,1)})
+        ref = self.f.store.add(message)
+        self.map.add(message,1_000_000)
+        self.assertEqual(self.map.snapshot(1_000_000)['free'],[[3,1]])
+        new_key = NodeKey.generate()
+        self.f.store.replace_anchors({**self.f.store.anchors, 'lidar': replace(
+            self.f.anchors['lidar'], public_key=new_key.public_key)})
+        self.assertEqual(self.map.snapshot(1_000_000)['free'],[])
+        self.f.store.replace_anchors(self.f.anchors)
+        self.assertEqual(self.map.snapshot(1_000_000)['free'],[[3,1]])
+        self.f.store.discard(ref)
+        self.assertEqual(self.map.snapshot(1_000_000)['free'],[])
 
     def test_relay_inherits_origin_trust_and_expiry_not_just_relay_signature(self):
         untrusted = self.f.coverage(source='attacker', free={(3, 1)})

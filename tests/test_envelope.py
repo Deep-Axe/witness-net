@@ -1,5 +1,6 @@
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
 from coopx.domain import ObjectClass, Observation, PositionAnchor
 from coopx.envelope import (Auth, Envelope, Lineage, ObservationMessage, Geometry,
@@ -196,6 +197,61 @@ class EnvelopeTests(unittest.TestCase):
         message = self.original(parents=("0"*64,))
         self.store.add(message)
         self.assertEqual(self.store.authenticated_roots(message), set())
+
+    def test_signature_and_roots_are_cached_under_immutable_anchor_snapshot(self):
+        original = self.original()
+        actual = NodeKey.verify
+        with patch.object(NodeKey, 'verify', wraps=actual) as verify_call:
+            ref = self.store.add(original)
+            for _ in range(10):
+                self.store.add(encode(original))
+                self.assertEqual(self.store.authenticated_roots(original), {ref})
+            self.assertEqual(verify_call.call_count, 1)
+        with self.assertRaises(TypeError):
+            self.store.anchors['pole'] = self.anchors['car']
+        # Changing the caller's input mapping has no effect on the snapshot.
+        self.anchors.clear()
+        self.assertEqual(self.store.authenticated_roots(original), {ref})
+        self.store.replace_anchors({})
+        self.assertEqual(self.store.authenticated_roots(original), set())
+
+    def test_pruned_original_fails_closed_then_resolves_when_restored(self):
+        original = self.original()
+        ref = self.store.add(original)
+        relay = self.relay(original)
+        self.store.add(relay)
+        self.assertEqual(self.store.authenticated_roots(relay), {ref})
+        self.store.discard(ref)
+        self.assertEqual(self.store.authenticated_roots(relay), set())
+        self.store.add(original)
+        self.assertEqual(self.store.authenticated_roots(relay), {ref})
+
+    def test_recent_observation_index_is_inclusive_and_discard_safe(self):
+        messages = [self.original(mid=f'index-{i}', seq=i) for i in range(20)]
+        for message in reversed(messages):
+            self.store.add(message)
+        recent = self.store.recent_observations(1007, 1009)
+        self.assertEqual([m.envelope.capture_time_us for m in recent], [1007, 1008, 1009])
+        self.store.discard(evidence_ref(recent[1]))
+        self.assertEqual(len(self.store.recent_observations(1007, 1009)), 2)
+        self.assertEqual(self.store.recent_observations(5000, 6000), ())
+
+    def test_nested_anchor_inputs_are_frozen_not_aliased_into_caches(self):
+        region=[-100.,-100.,-5.,100.,100.,10.]
+        causes=['calibration-1']
+        anchor=replace(self.anchors['pole'], permitted_region=region, common_causes=causes)
+        store=EvidenceStore({'pole':anchor})
+        region[3]=10000.
+        causes.append('changed')
+        self.assertEqual(store.anchors['pole'].permitted_region[3],100.)
+        self.assertEqual(store.anchors['pole'].common_causes,('calibration-1',))
+
+    def test_decoded_wire_cache_is_invalidated_by_dataclass_replacement(self):
+        original = self.original()
+        self.assertIsNotNone(original._wire)
+        modified = replace(original, observation=replace(original.observation, xyz_m=(50., 2., 1.)))
+        self.assertIsNone(modified._wire)
+        self.assertFalse(verify(modified, self.anchors))
 
     def test_lineage_cannot_launder_unrelated_content_into_witness_credit(self):
         pole = self.original()

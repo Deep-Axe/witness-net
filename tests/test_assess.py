@@ -2,6 +2,9 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 import unittest
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
 
 from coopx.assess import Assessor, footprint
 from coopx.checker import Checker
@@ -67,6 +70,32 @@ class AssessmentTests(unittest.TestCase):
         self.assertTrue(result.supporting)
         self.assertTrue(result.contradicting)
 
+    def test_two_honest_wrong_cameras_contested_but_lone_unanchored_ghost_contradicted(self):
+        self.f.store.replace_anchors({s: replace(a, anchored=True) for s, a in self.f.anchors.items()})
+        free = self.f.coverage(free={(3, 1)})
+        self.map.add(free, 1_000_000)
+        camera1, camera2 = self.f.observation(), self.f.observation(source='car')
+        self.f.store.add(camera2)
+        with patch.object(self.f.store, 'messages', side_effect=AssertionError('full archive scan')):
+            result = self.assessor.assess(camera1, 1_000_000)
+        self.assertEqual((result.state, result.codes), ('contested', ('CONTESTED',)))
+        self.assertEqual(set(result.supporting), {evidence_ref(camera1), evidence_ref(camera2)})
+        self.assertEqual(result.contradicting, (evidence_ref(free),))
+        separate = Fixture()
+        coverage_map = CoverageMap(separate.spec)
+        assessor = Assessor(separate.store, coverage_map)
+        coverage_map.add(separate.coverage(free={(3, 1)}), 1_000_000)
+        self.assertEqual(assessor.assess(separate.observation(source='attacker'), 1_000_000).state, 'contradicted')
+
+    def test_s2_signature_verification_cost_is_linear_in_admitted_packets(self):
+        from coopx.pipeline import run_s2
+        from coopx.identity import NodeKey
+        actual = NodeKey.verify
+        with tempfile.TemporaryDirectory() as directory, patch.object(NodeKey, 'verify', wraps=actual) as verified:
+            summary = run_s2(Path(directory) / 'cost.jsonl', seed=0, key_seed=1)
+        packets = summary['accepted'] + summary['rejected']
+        self.assertLessEqual(verified.call_count, 2 * packets)
+
     def test_half_footprint_threshold_and_unknown_outside_map_denominator(self):
         # +/- 1m about x=4 covers x=3,4; one of two cells is enough.
         subject = self.f.observation(xyz=(4., 1.5, 1.), std=(1., 0., 0.))
@@ -109,7 +138,7 @@ class AssessmentTests(unittest.TestCase):
         self.f.store.add(ghost)
         self.assertEqual(self.assessor.assess(tracked, 1_000_000).state, 'unverified')
         for source in ('car', 'other'):
-            self.f.store.anchors[source] = replace(self.f.anchors[source], trust_class=TrustClass.B)
+            self.f.store.replace_anchors({**self.f.store.anchors, source: replace(self.f.anchors[source], trust_class=TrustClass.B)})
             self.f.store.add(self.f.observation(source=source))
         self.assertEqual(self.assessor.assess(ghost, 1_000_000).state, 'unverified')
 
@@ -117,7 +146,7 @@ class AssessmentTests(unittest.TestCase):
         subject = self.f.observation()
         self.map.add(self.f.coverage(source='attacker', occupied={(3, 1)}), 1_000_000)
         self.assertEqual(self.assessor.assess(subject, 1_000_000).codes, ('UNVERIFIED_SINGLE_SOURCE',))
-        self.f.store.anchors['lidar'] = replace(self.f.anchors['lidar'], physical_observer='pole')
+        self.f.store.replace_anchors({**self.f.store.anchors, 'lidar': replace(self.f.anchors['lidar'], physical_observer='pole')})
         self.map.add(self.f.coverage(occupied={(3, 1)}), 1_000_000)
         self.assertEqual(self.assessor.assess(subject, 1_000_000).codes, ('UNVERIFIED_SINGLE_SOURCE',))
 

@@ -104,7 +104,9 @@ class Assessor:
     def _eligible(self, message):
         anchor = self.store.anchors.get(message.envelope.source_id)
         points = coverage_bounds(message.content) if isinstance(message, CoverageMessage) else (message.observation.xyz_m,)
-        return evidence_eligible(anchor) and all(anchor.permits(point) for point in points)
+        return (evidence_eligible(anchor) and self.store.get(self.store.reference(message)) is not None
+                and bool(self.store.authenticated_roots(message))
+                and all(anchor.permits(point) for point in points))
 
     def _independent_range(self, coverage, subject):
         anchor = self.store.anchors.get(coverage.envelope.source_id)
@@ -150,8 +152,8 @@ class Assessor:
             return Assessment("unverified", ("UNVERIFIED_SINGLE_SOURCE",), cells, (), (),
                               "UNVERIFIED_SINGLE_SOURCE: inactive observation")
         self.coverage_map.add_observation(message, now_us)
-        candidates = [m for m in self.store.messages() if isinstance(m, ObservationMessage)
-                      and self._active(m, now_us)]
+        candidates = [m for m in self.store.recent_observations(
+            now_us - self.coverage_map.ttl_us, now_us) if self._active(m, now_us)]
         def relevant(root, claim):
             return self._active(root, now_us) and self._eligible(root) and self.agrees(root, claim)
         witnesses = self.store.independent_witnesses(message, candidates, relevant)

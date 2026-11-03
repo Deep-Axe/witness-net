@@ -7,12 +7,14 @@ Freshness, replay, permissions and spatial relevance belong to the checker.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, replace
+from bisect import bisect_left, bisect_right, insort
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 import hashlib
 import math
 import struct
 from typing import Callable, Iterable, TYPE_CHECKING
+from types import MappingProxyType
 
 if TYPE_CHECKING:
     from coopx.coverage import CoverageMessage
@@ -114,6 +116,7 @@ class ObservationMessage:
     kind: Kind = Kind.PERCEIVED
     geometry: Geometry = Geometry.POINT_STD
     label_id: int | None = None
+    _wire: bytes | None = field(default=None, init=False, compare=False, repr=False)
 
     def __post_init__(self):
         e, o, l = self.envelope, self.observation, self.lineage
@@ -158,6 +161,8 @@ def _pack_text(value):
     return struct.pack("<H", len(raw)) + raw
 
 def signing_bytes(message: ObservationMessage | CoverageMessage) -> bytes:
+    if message._wire is not None:
+        return message._wire[:-64]
     if not isinstance(message, ObservationMessage):
         from coopx.coverage import CoverageMessage, coverage_signing_bytes
         if not isinstance(message, CoverageMessage):
@@ -192,6 +197,8 @@ def sign(message: ObservationMessage | CoverageMessage, key: NodeKey):
 def encode(message: ObservationMessage | CoverageMessage) -> bytes:
     if len(message.envelope.auth.signature) != 64:
         raise ValueError("signed message required")
+    if message._wire is not None:
+        return message._wire
     return signing_bytes(message) + message.envelope.auth.signature
 
 def decode(raw: bytes) -> ObservationMessage | CoverageMessage:
@@ -231,6 +238,7 @@ def decode(raw: bytes) -> ObservationMessage | CoverageMessage:
     # exactly the bytes received, even for fields ignored by the CX1 decoder.
     if encode(message) != raw:
         raise ValueError("noncanonical CX2 encoding")
+    object.__setattr__(message, "_wire", raw)
     return message
 
 def verify(message: ObservationMessage | CoverageMessage, anchors: TrustAnchors) -> bool:
@@ -280,17 +288,71 @@ def default_agrees(root_message: ObservationMessage, claim: ObservationMessage) 
     return math.dist(root.xyz_m, target.xyz_m) <= gate_m
 
 class EvidenceStore:
-    """Content-addressed authenticated packets, with a snapshot of trust anchors."""
+    """Content-addressed packets with cached verification and resolved lineage.
+
+    Trust anchors are a deeply immutable construction-time snapshot. Positive
+    signature/root caches are sound under that snapshot; replace_anchors()
+    invalidates both. Missing/cyclic roots are never cached. discard() also
+    invalidates lineage caches so pruned originals fail closed. Observation
+    candidates are indexed by capture time; archived evidence need not be
+    scanned or deleted to expire it from assessment.
+    """
     def __init__(self, anchors: TrustAnchors):
-        self.anchors = dict(anchors)
         self._messages: dict[str, ObservationMessage | CoverageMessage] = {}
+        self._identity_refs: dict[int, str] = {}
+        self._verified: set[str] = set()
+        self._roots: dict[str, frozenset[str]] = {}
+        self._observation_index: list[tuple[int, str]] = []
+        self.anchor_epoch = 0
+        self.proof_epoch = 0
+        self.replace_anchors(anchors)
+
+    @property
+    def anchors(self):
+        return self._anchors
+
+    def replace_anchors(self, anchors: TrustAnchors) -> None:
+        self._anchors = MappingProxyType({source: replace(
+            anchor, public_key=bytes(anchor.public_key), common_causes=tuple(anchor.common_causes),
+            permitted_region=None if anchor.permitted_region is None else tuple(anchor.permitted_region))
+            for source, anchor in anchors.items()})
+        self._verified.clear()
+        self._roots.clear()
+        self.anchor_epoch += 1
+        self.proof_epoch += 1
+
+    def reference(self, message) -> str:
+        ref = self._identity_refs.get(id(message))
+        return ref if ref is not None and self._messages.get(ref) is message else evidence_ref(message)
+
+    def _verify(self, message, ref):
+        if ref not in self._verified:
+            if not verify(message, self.anchors):
+                return False
+            self._verified.add(ref)
+        return True
 
     def add(self, message: ObservationMessage | CoverageMessage | bytes) -> str:
-        message = decode(message) if isinstance(message, bytes) else decode(encode(message))
-        if not verify(message, self.anchors):
+        if isinstance(message, bytes):
+            raw = message
+            ref = hashlib.sha256(raw).hexdigest()
+        else:
+            ref = self.reference(message)
+            raw = None
+        existing = self._messages.get(ref)
+        canonical = existing
+        if canonical is None:
+            # Only our decoder sets _wire, after canonical validation. Decoded
+            # bodies are deeply immutable; dataclasses.replace resets _wire.
+            canonical = (message if raw is None and message._wire is not None
+                         else decode(raw if raw is not None else encode(message)))
+        if not self._verify(canonical, ref):
             raise ValueError("unauthenticated evidence")
-        ref = evidence_ref(message)
-        self._messages[ref] = message
+        if existing is None:
+            self._messages[ref] = canonical
+            self._identity_refs[id(canonical)] = ref
+            if isinstance(canonical, ObservationMessage):
+                insort(self._observation_index, (canonical.envelope.capture_time_us, ref))
         return ref
 
     def get(self, ref: str) -> ObservationMessage | CoverageMessage | None:
@@ -300,14 +362,34 @@ class EvidenceStore:
         """Snapshot of authenticated packets; admission/freshness is separate."""
         return tuple(self._messages.values())
 
+    def recent_observations(self, start_us: int, end_us: int) -> tuple[ObservationMessage, ...]:
+        """Inclusive capture-time range, O(log archive + candidates), no full scan."""
+        if type(start_us) is not int or type(end_us) is not int or start_us > end_us:
+            raise ValueError("ordered integer capture-time bounds required")
+        lo = bisect_left(self._observation_index, (start_us, ""))
+        hi = bisect_right(self._observation_index, (end_us, "~"))
+        return tuple(self._messages[ref] for _, ref in self._observation_index[lo:hi])
+
+    def discard(self, ref: str) -> None:
+        message = self._messages.pop(ref, None)
+        if message is not None:
+            self._identity_refs.pop(id(message), None)
+            self._verified.discard(ref)
+            if isinstance(message, ObservationMessage):
+                entry = (message.envelope.capture_time_us, ref)
+                self._observation_index.pop(bisect_left(self._observation_index, entry))
+            self._roots.clear()
+            self.proof_epoch += 1
+
     def authenticated_roots(self, message: ObservationMessage | CoverageMessage) -> frozenset[str]:
         """Fail closed on missing, fabricated, mismatched or cyclic provenance."""
         def resolve(current, visiting):
-            if len(visiting) >= 64 or not verify(current, self.anchors):
+            ref = self.reference(current)
+            if ref in visiting or len(visiting) >= 64 or not self._verify(current, ref):
                 return None
-            ref, l, e = evidence_ref(current), current.lineage, current.envelope
-            if ref in visiting:
-                return None
+            if ref in self._roots:
+                return self._roots[ref]
+            l, e = current.lineage, current.envelope
             visiting = visiting | {ref}
             dependencies = []
             for parent_ref in l.parents:
@@ -317,7 +399,9 @@ class EvidenceStore:
                     return None
                 dependencies.extend(roots)
             if l.derivation == "direct":
-                return set(dependencies) | {ref}
+                roots = frozenset(dependencies) | {ref}
+                self._roots[ref] = roots
+                return roots
             original = self.get(l.root_ref)
             if original is None or original.lineage.derivation != "direct":
                 return None
@@ -341,7 +425,9 @@ class EvidenceStore:
                 return None
             # Forwarding cannot manufacture extra witnesses by attaching other
             # packets. Only the original measurement supplies relay support.
-            return set(roots) if l.derivation == "relayed" else set(dependencies) | set(roots)
+            result = frozenset(roots) if l.derivation == "relayed" else frozenset(dependencies) | roots
+            self._roots[ref] = result
+            return result
         return frozenset(resolve(message, set()) or ())
 
     def independent_witnesses(
@@ -363,7 +449,7 @@ class EvidenceStore:
             if not isinstance(message, ObservationMessage):
                 continue  # A coverage root cannot confirm a semantic class.
             for ref in self.authenticated_roots(message):
-                root = self.get(ref) or (message if ref == evidence_ref(message) else None)
+                root = self.get(ref) or (message if ref == self.reference(message) else None)
                 if isinstance(root, ObservationMessage):
                     roots_to_messages[ref] = root
         # Each authenticated direct root is a candidate witness. Dependency
