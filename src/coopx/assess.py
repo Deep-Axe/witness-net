@@ -140,6 +140,43 @@ class Assessor:
         # measured dimensions. Reject explicit below-resolution objects.
         return o.dimensions_m is None or min(o.dimensions_m[:2]) >= c.min_size_m
 
+    def _range_evidence(self, message, cells, now_us, *, coverage_ref=None):
+        """Shared range policy for assessment and single-report proof callbacks."""
+        free_cells = set()
+        free_refs = set()
+        geometric_refs = set()
+        for cell in cells:
+            for record in self.coverage_map.records_at(cell, now_us):
+                if coverage_ref is not None and record.evidence_ref != coverage_ref:
+                    continue
+                coverage = record.message
+                if not isinstance(coverage, CoverageMessage) or not self._range_applies(coverage, message):
+                    continue
+                origin = record.range_origin
+                if (origin is None or not self._active(origin, now_us)
+                        or not self._range_applies(origin, message)):
+                    continue
+                if record.state == "free" and self._eligible(origin):
+                    free_cells.add(cell)
+                    free_refs.add(record.evidence_ref)
+                elif record.state == "occupied" and self._independent_range(origin, message):
+                    geometric_refs.add(record.evidence_ref)
+        return free_cells, free_refs, geometric_refs
+
+    def range_contradiction(self, message, coverage_ref, now_us):
+        """Whether ONE admitted range report contradicts this complete footprint.
+
+        A geometric proof, not permission to suppress a local detection. Uses
+        exactly the assessment's time/height/size/trust/lineage policy and 50%
+        footprint threshold. No observations are added and no GT is consulted.
+        """
+        if (not isinstance(message, ObservationMessage) or not self._active(message, now_us)
+                or self.store.get(self.store.reference(message)) is None):
+            return False
+        cells, denominator = footprint(message, self.coverage_map.spec)
+        free, _, _ = self._range_evidence(message, cells, now_us, coverage_ref=coverage_ref)
+        return bool(cells) and len(free)*2 >= denominator
+
     def assess(self, message: ObservationMessage, now_us: int) -> Assessment:
         if not isinstance(message, ObservationMessage):
             raise ValueError("assessment requires an admitted observation")
@@ -166,23 +203,7 @@ class Assessor:
                     if anchor.physical_observer is not None:
                         semantic_refs.add(ref)
 
-        free_cells = set()
-        free_refs = set()
-        geometric_refs = set()
-        for cell in cells:
-            for record in self.coverage_map.records_at(cell, now_us):
-                coverage = record.message
-                if not isinstance(coverage, CoverageMessage) or not self._range_applies(coverage, message):
-                    continue
-                origin = record.range_origin
-                if (origin is None or not self._active(origin, now_us)
-                        or not self._range_applies(origin, message)):
-                    continue
-                if record.state == "free" and self._eligible(origin):
-                    free_cells.add(cell)
-                    free_refs.add(record.evidence_ref)
-                elif record.state == "occupied" and self._independent_range(origin, message):
-                    geometric_refs.add(record.evidence_ref)
+        free_cells, free_refs, geometric_refs = self._range_evidence(message, cells, now_us)
         contradiction = bool(cells) and len(free_cells) * 2 >= denominator
         local = message.envelope.source_id == self.local_source_id
         if local:
