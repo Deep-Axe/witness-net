@@ -58,3 +58,19 @@ class S3EventTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MapObserverPoseTests(unittest.TestCase):
+    def snap(self, observers):
+        return {"schema": events.SCHEMA, "t_replay_us": 0, "type": "map_snapshot",
+                "source_id": "ego", "dest_id": None, "message_id": None, "message_type": None,
+                "evidence_ref": None, "bytes": None, "check_codes": [], "state": None,
+                "detail": {"occupied": [], "free": [], "contested": [], "unknown_count": 3600,
+                           "observers": observers}}
+
+    def test_observer_poses(self):
+        events.validate(self.snap([{"id": "rsu-2", "xy": [21.5, -180.0]}]))
+        for bad in ([{"id": "a", "xy": [1, float("nan")]}], [{"id": "a", "xy": [1]}],
+                    [{"id": "a", "xy": [1, 2]}, {"id": "a", "xy": [3, 4]}], [{"id": "", "xy": [1, 2]}]):
+            with self.assertRaises(ValueError):
+                events.validate(self.snap(bad))

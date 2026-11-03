@@ -151,6 +151,20 @@ def _s2_detail(d):
                     kinds.add(claim[1])
                 if kinds != {"free", "occupied"}:
                     raise ValueError("a contested cell needs both a free and an occupied claim")
+        if "observers" in detail:
+            # Optional: where each observer actually is (site frame), for the map.
+            entries = detail["observers"]
+            if type(entries) is not list or len(entries) > 256:
+                raise ValueError("observers must be a bounded list")
+            seen = set()
+            for entry in entries:
+                if (type(entry) is not dict or set(entry) != {"id", "xy"}
+                        or type(entry["id"]) is not str or not entry["id"].strip()
+                        or entry["id"] in seen or type(entry["xy"]) is not list
+                        or len(entry["xy"]) != 2
+                        or not all(_number(v, -math.inf) for v in entry["xy"])):
+                    raise ValueError("observer entry must be {id, xy:[x,y]} with a unique id")
+                seen.add(entry["id"])
 
 
 def _number(value, low=0.0):
