@@ -126,6 +126,16 @@ class CameraObserver:
         return sign(ObservationMessage(envelope, observation, lineage, Kind.PERCEIVED,
                                        label_id=label_id), self.key)
 
+    def _lift(self, detection: Detection, frame: CameraFrame):
+        """Pass mask= when the lift accepts it (Agent A's seam); else the box."""
+        args = (detection.box_xyxy, frame.agent_frame, frame.camera_name)
+        if detection.mask is not None:
+            try:
+                return self.lift_fn(*args, mask=detection.mask)
+            except TypeError:
+                pass
+        return self.lift_fn(*args)
+
     def _detect(self, frame: CameraFrame, concept: str, query_time_us: int):
         key = (frame.capture_us, normalize_concept(concept.strip()))
         if key in self._segmented:
@@ -141,7 +151,7 @@ class CameraObserver:
         self._events.append(model_call_event(result, self.observer_id))
         messages = []
         for index, detection in enumerate(detections):
-            lifted = self.lift_fn(detection.box_xyxy, frame.agent_frame, frame.camera_name)
+            lifted = self._lift(detection, frame)
             if lifted is None:
                 continue
             cls = CLASS_CONCEPTS.get(normalize_concept(concept.strip()), ObjectClass.UNKNOWN)
