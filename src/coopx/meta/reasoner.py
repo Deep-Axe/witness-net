@@ -15,7 +15,7 @@ import math
 import re
 
 from coopx.query import (Answer, CLASS_CONCEPTS, Capability, MAX_QUERIES, MAX_RADIUS_M,
-                        Query, STATES, TIERS, Verdict, normalize_concept)
+                        Query, STATES, TIERS, Verdict, inside_polygon, normalize_concept)
 
 PLAN_FORMAT = {'type': 'json_schema', 'name': 'coopx_plan_v1', 'strict': True,
     'schema': {'type': 'object', 'additionalProperties': False, 'required': ['queries'],
@@ -174,7 +174,38 @@ class Reasoner:
                 self._plan_calls[query.query_id] = (result.call_id, result.availability_time_us)
             except (ValueError, TypeError, KeyError, OverflowError):
                 self._reject('plan', 'INVALID_QUERY', index)
+        queries.extend(self._verify_queries(queries, caps, context, result, now_us))
         return queries, result
+
+    def _verify_queries(self, queries, caps, context, result, now_us):
+        """Deterministic Verify: never leave a region checked by one body alone.
+
+        If every planned query targets one physical observer while another
+        physical observer's footprint contains the asked point, add one T2
+        query to it. Body identity comes from the caller's trust anchors
+        (context.physical_observers), never from model output. Adds no model call.
+        """
+        bodies = context.get('physical_observers')
+        if type(bodies) is not dict or not queries or len(queries) >= self.max_queries:
+            return []
+        body = lambda oid: bodies.get(oid, oid)
+        asked = {body(q.observer_id) for q in queries}
+        if len(asked) != 1:
+            return []
+        first = queries[0]
+        concept = next((q.concept for q in queries if q.concept is not None
+                        and normalize_concept(q.concept) in CLASS_CONCEPTS), None)
+        for oid in sorted(caps):
+            cap = caps[oid]
+            if (body(oid) in asked or 'T2' not in cap.query_tiers
+                    or not inside_polygon(first.center_xy, cap.coverage_xy)):
+                continue
+            query = Query(f'q-{result.call_id}-{now_us}-verify', 'T2', oid, first.center_xy,
+                          first.radius_m, first.time_us, concept,
+                          'deterministic verify: a second physical observer covers this region')
+            self._plan_calls[query.query_id] = (result.call_id, result.availability_time_us)
+            return [query]
+        return []
 
     def judge(self, question, queries, answers, evidence, now_us):
         if (type(question) is not str or not question.strip() or len(question) > 4096

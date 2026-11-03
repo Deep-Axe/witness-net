@@ -348,5 +348,33 @@ class SingleSupportConflictTests(unittest.TestCase):
         self.assertEqual(self.run_case(callback=lambda a,b:True,state='contradicted')[0].state,'contradicted')
 
 
+
+class DeterministicVerifyTests(unittest.TestCase):
+    def test_adds_one_query_to_a_second_physical_observer(self):
+        from types import SimpleNamespace
+        from coopx.meta.reasoner import Reasoner
+        from coopx.query import Capability
+        square = ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0))
+        far = ((50.0, 50.0), (60.0, 50.0), (60.0, 60.0))
+        caps = [Capability("rsu-2", ("camera_rgb",), ("T1", "T2", "T3"), "open", square),
+                Capability("rsu-1", ("camera_rgb",), ("T1", "T2", "T3"), "open", square),
+                Capability("rsu-1b", ("camera_rgb",), ("T1", "T2", "T3"), "open", far)]
+        row = {"tier": "T1", "observer_id": "rsu-2", "center_xy": [5.0, 5.0], "radius_m": 2.0,
+               "concept": "person", "reason": "x"}
+
+        class Client:
+            def respond(self, **kw):
+                return SimpleNamespace(json={"queries": [row, dict(row, tier="T2")]}, text="",
+                                       call_id="p1", availability_time_us=kw["query_time_us"] + 1)
+        bodies = {"rsu-2": "rsu-2", "rsu-1": "rsu-1", "rsu-1b": "rsu-1"}
+        queries, _ = Reasoner(Client()).plan("anyone?", caps, {"physical_observers": bodies}, 9)
+        self.assertEqual([(q.observer_id, q.tier) for q in queries],
+                         [("rsu-2", "T1"), ("rsu-2", "T2"), ("rsu-1", "T2")])
+        self.assertEqual(queries[-1].concept, "person")
+        # Without trusted body identities, nothing is added.
+        queries, _ = Reasoner(Client()).plan("anyone?", caps, {}, 9)
+        self.assertEqual(len(queries), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
