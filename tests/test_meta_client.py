@@ -175,6 +175,33 @@ class MetaClientTests(unittest.TestCase):
             self.assertEqual(len(once.requests), 1)
             self.assertNotIn("secret-test-key", str(ctx.exception))
 
+    def test_ledger_release_appends_and_needs_confirm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cost.jsonl"
+            path.write_text(
+                '{"kind":"settle","rid":"done","cost_usd":0.01}\n'
+                '{"kind":"reserve","rid":"open-1","product":"sam-3.1","amount":0.0075}\n'
+                '{"kind":"reserve","rid":"open-2","product":"muse-spark-1.3","amount":0.05}\n',
+                encoding="utf-8")
+            client = self._client(tmp, FakePost([]))
+            client.cost_log = path
+            status = client.ledger_status()
+            self.assertAlmostEqual(status["settled_usd"], 0.01)
+            self.assertEqual(sorted(item["rid"] for item in status["outstanding"]),
+                             ["open-1", "open-2"])
+            with self.assertRaises(ValueError):
+                client.release_reservations(rid="open-1", confirm=False, reason="no")
+            self.assertEqual(path.read_text(encoding="utf-8").count("\n"), 3)
+            released = client.release_reservations(
+                rid="open-1", confirm=True, reason="confirmed unbilled against dashboard")
+            self.assertEqual(released["released"], ["open-1"])
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('{"kind":"settle","rid":"done","cost_usd":0.01}', text)
+            self.assertIn('"kind":"release"', text)
+            self.assertEqual([item["rid"] for item in client.ledger_status()["outstanding"]],
+                             ["open-2"])
+            self.assertAlmostEqual(client.logged_cost_usd(), 0.06)
+
     def test_rejects_contributor_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             client = self._client(tmp, FakePost([]))

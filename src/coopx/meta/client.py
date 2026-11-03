@@ -451,6 +451,69 @@ class MetaClient:
             query_time_us=query_time_us, availability_time_us=availability,
             precomputed=precomputed, stage=stage)
 
+    def ledger_status(self) -> dict:
+        """Settled spend versus reservations that were never settled or released."""
+        if not self.cost_log.is_file():
+            return {"rows": 0, "settled_usd": 0.0, "outstanding_usd": 0.0,
+                    "outstanding": [], "ledger_usd": 0.0}
+        with self._locked_ledger() as handle:
+            return self._ledger_parts(handle)
+
+    @staticmethod
+    def _ledger_parts(handle) -> dict:
+        handle.seek(0)
+        spent, outstanding, rows = 0.0, {}, 0
+        for line in handle.read().splitlines():
+            if not line.strip():
+                continue
+            rows += 1
+            row = json.loads(line)
+            kind = row.get("kind")
+            if kind == "reserve":
+                outstanding[row["rid"]] = {
+                    "rid": row["rid"], "product": row.get("product"),
+                    "amount": float(row["amount"]),
+                }
+            elif kind in ("settle", "release"):
+                outstanding.pop(row.get("rid"), None)
+                spent += float(row.get("cost_usd") or 0.0)
+            else:
+                spent += float(row.get("cost_usd") or 0.0)
+        open_rows = sorted(outstanding.values(), key=lambda item: item["rid"])
+        outstanding_usd = sum(item["amount"] for item in open_rows)
+        return {
+            "rows": rows,
+            "settled_usd": round(spent, 8),
+            "outstanding_usd": round(outstanding_usd, 8),
+            "outstanding": open_rows,
+            "ledger_usd": round(spent + outstanding_usd, 8),
+        }
+
+    def release_reservations(self, *, rid: str | None = None, uncertain: bool = False,
+                             confirm: bool = False, reason: str = "") -> dict:
+        """Append release rows. Never deletes. Requires an explicit confirm and a reason."""
+        if confirm is not True:
+            raise ValueError("releasing a reservation requires confirm=True")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("release requires a nonempty reason")
+        if uncertain == bool(rid):
+            raise ValueError("pass one reservation id or uncertain=True, not both")
+        with self._locked_ledger() as handle:
+            status = self._ledger_parts(handle)
+            open_ids = {item["rid"] for item in status["outstanding"]}
+            targets = sorted(open_ids) if uncertain else [rid]
+            missing = [item for item in targets if item not in open_ids]
+            if missing:
+                raise ValueError(f"not an outstanding reservation: {missing[0]}")
+            for item in targets:
+                self._write_row(handle, {
+                    "kind": "release", "rid": item, "cost_usd": 0.0,
+                    "reason": reason.strip(),
+                })
+            released = list(targets)
+        after = self.ledger_status()
+        return {"released": released, **after}
+
 
 def model_call_event(result: ModelResult, source_id: str) -> dict:
     """Contract-5 model_call, logged at the result's availability time."""

@@ -106,8 +106,8 @@ class S3PipelineTests(unittest.TestCase):
             self.assertGreater(counts.get("answer", 0), 0)
             self.assertGreater(counts.get("verdict", 0), 0)
             self.assertGreater(summary["accepted"], 0)
-            # Two SAM fast-path calls (rsu-2 and rsu-1); T3 "person" reuses rsu-2.
-            self.assertEqual(post.calls, ["sam-3.1", "sam-3.1", "coopx_plan_v1", "coopx_judge_v1"])
+            # Fast path: rsu-2, rsu-1, and all four ego cameras. T3 "person" reuses rsu-2.
+            self.assertEqual(post.calls, ["sam-3.1"] * 6 + ["coopx_plan_v1", "coopx_judge_v1"])
             self.assertEqual(summary["queries"], [
                 {"observer_id": "rsu-2", "tier": "T3", "concept": "person"}])
             self.assertEqual(summary["answers"], ["detected"])
@@ -121,7 +121,7 @@ class S3PipelineTests(unittest.TestCase):
             self.assertEqual(len(verdict["detail"]["model_call_ids"]), 2)
             sam_calls = [e for e in events if e["type"] == "model_call"
                          and e["detail"]["product"] == "sam-3.1"]
-            self.assertEqual(len(sam_calls), 2)  # rsu-2 + rsu-1; T3 reuses rsu-2
+            self.assertEqual(len(sam_calls), 6)  # two RSUs and four ego cameras; T3 reuses rsu-2
             plan = next(e for e in events if e["type"] == "model_call"
                         and e["detail"]["stage"] == "plan")
             self.assertEqual(plan["detail"]["question"], summary["question"])

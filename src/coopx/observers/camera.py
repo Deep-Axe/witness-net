@@ -26,10 +26,19 @@ from coopx.query import (CLASS_CONCEPTS, Answer, Capability, Query, answer_query
 
 MAX_LABELS = 64
 
+def declared_camera_footprint(frame: AgentFrame, camera_name: str):
+    """A's dense footprint when present; the 4-ray 40 m polygon until then."""
+    try:
+        from coopx.observers.footprint import camera_footprint
+        return camera_footprint(frame, camera_name)
+    except ImportError:
+        return camera_footprint_xy(frame, camera_name, max_range_m=40.0)
+
+
 def rsu_camera_capability(observer_id: str, frame: AgentFrame, camera_name: str) -> Capability:
     return Capability(
         observer_id, ("camera_rgb",), ("T0", "T1", "T2", "T3"), "open",
-        camera_footprint_xy(frame, camera_name, max_range_m=40.0))
+        declared_camera_footprint(frame, camera_name))
 
 
 @dataclass
@@ -57,7 +66,8 @@ class CameraObserver:
                  camera_name: str, client: MetaClient, lift_fn: Callable, key: NodeKey,
                  *, session: str = "s3", spatial_frame: str = "site_map",
                  ttl_us: int = 1_000_000, concepts: tuple[str, ...] = ("person",),
-                 answer_fn=answer_query):
+                 answer_fn=answer_query, period_us: int = 0,
+                 seq_origin: int = 0):
         self.observer_id = observer_id
         self.frame_source = frame_source
         self.camera_name = camera_name
@@ -69,7 +79,11 @@ class CameraObserver:
         self.ttl_us = ttl_us
         self.concepts = concepts
         self.answer_fn = answer_fn
-        self._seq = 0
+        self.period_us = int(period_us)
+        self._last_observe_us: int | None = None
+        # Separate cameras of one vehicle share a source id, so sequences must not collide.
+        self._seq = int(seq_origin)
+        self._object_seq = 199 + int(seq_origin)
         self._latest: CameraFrame | None = None
         # What THIS observer signed and sent. Not "admitted": only the
         # receiving consumer's checker decides that.
@@ -171,6 +185,10 @@ class CameraObserver:
         if frame is None:
             return []
         self._latest = frame
+        if (self.period_us > 0 and self._last_observe_us is not None
+                and frame.capture_us - self._last_observe_us < self.period_us):
+            return []
+        self._last_observe_us = frame.capture_us
         published = []
         for concept in self.concepts:
             messages, _result = self._detect(frame, concept, frame.capture_us)

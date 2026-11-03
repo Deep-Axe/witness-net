@@ -113,6 +113,28 @@ def main() -> None:
                     help="Use the disk cache only; refuse uncached Meta calls")
     s3.add_argument("--key-seed", type=int, default=0)
     s3.add_argument("--budget-usd", type=float, default=3.0)
+    evaluate = sub.add_parser("eval", help="S4a: fusion x attack metrics, Muse off")
+    evaluate.add_argument("--scene", default="frame-000096")
+    evaluate.add_argument("--fusion", default="witness",
+                          choices=("ego", "union", "geo", "witness", "all"))
+    evaluate.add_argument("--attack", default=None)
+    evaluate.add_argument("--seed", type=int, default=0)
+    evaluate.add_argument("--offline", action="store_true",
+                          help="SAM cache only; a miss is reported, not billed")
+    evaluate.add_argument("--perception", default="sam", choices=("sam", "gt-oracle"),
+                          help="sam is the headline; gt-oracle is the labelled comparison")
+    evaluate.add_argument("--budget-usd", type=float, default=2.0)
+    evaluate.add_argument("--output-dir", type=Path, default=Path("data/results"))
+    evaluate.add_argument("--summary", type=Path, default=Path("results/summary.md"))
+    ledger = sub.add_parser("ledger", help="Settled spend vs outstanding reservations")
+    ledger.add_argument("--show", action="store_true")
+    ledger.add_argument("--release", default=None, help="Reservation id to release")
+    ledger.add_argument("--release-uncertain", action="store_true",
+                        help="Release every outstanding reservation")
+    ledger.add_argument("--confirm", action="store_true",
+                        help="Required to append a release row")
+    ledger.add_argument("--reason", default="")
+    ledger.add_argument("--ledger", type=Path, default=Path("data/cost-log.jsonl"))
     args = parser.parse_args()
     try:
         if args.command == "synthetic":
@@ -128,6 +150,23 @@ def main() -> None:
             from coopx.pipeline import run_s3
             result = run_s3(args.output, overwrite=args.overwrite, offline=args.offline,
                             key_seed=args.key_seed, budget_usd=args.budget_usd)
+        elif args.command == "eval":
+            from coopx.eval.report import write_summary
+            from coopx.eval.runner import run_eval
+            result = run_eval(scene=args.scene, fusion=args.fusion, attack=args.attack,
+                              seed=args.seed, offline=args.offline, budget_usd=args.budget_usd,
+                              out_dir=args.output_dir, perception=args.perception)
+            write_summary(args.output_dir, args.summary)
+            result["summary"] = str(args.summary)
+        elif args.command == "ledger":
+            from coopx.meta.client import MetaClient
+            client = MetaClient(cost_log=args.ledger, budget_usd=1.0, environ={}, offline=True)
+            if args.release or args.release_uncertain:
+                result = client.release_reservations(
+                    rid=args.release, uncertain=args.release_uncertain,
+                    confirm=args.confirm, reason=args.reason)
+            else:
+                result = client.ledger_status()
         else:
             from coopx.pipeline import run_s1
             result = run_s1(args.output, seed=args.seed, loss=args.loss,
