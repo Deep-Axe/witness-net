@@ -285,5 +285,84 @@ class EventTests(unittest.TestCase):
             to_json_line(self.event(detail={'bad': float('nan')}))
 
 
-if __name__ == '__main__':
+
+
+class SnapshotCheckerTests(unittest.TestCase):
+    """Same replay state, separate semantics, unchanged live compatibility gates."""
+
+    setUp = CheckerTests.setUp
+    packet = CheckerTests.packet
+
+    def test_delayed_generation_is_snapshot_only_and_does_not_change_latest(self):
+        live = self.packet(mid='live', seq=1, capture=9_500_000)
+        self.assertEqual(self.checker.check(live, 9_500_000).mode, 'live')
+        previous = self.checker.latest('pole', 7)
+        raw = self.packet(mid='snapshot', seq=2, capture=1_000_000, generation=10_000_000)
+        self.assertIn('STALE', self.checker.check(raw, 10_100_000).codes)
+        result = self.checker.check(raw, 10_100_000, scene_time_us=1_000_000)
+        self.assertEqual((result.state, result.codes, result.mode), ('accepted', ('OK',), 'snapshot'))
+        self.assertIs(self.checker.latest('pole', 7), previous)
+        self.assertIn('DUPLICATE', self.checker.check(raw, 10_100_000, scene_time_us=1_000_000).codes)
+        self.assertIn('DUPLICATE', self.checker.check(raw, 10_100_000).codes)
+
+    def test_capture_generation_expiry_and_future_bounds(self):
+        for changes, scene, code in (
+            ({'capture':1_000_000, 'generation':10_000_000}, 2_000_000, 'STALE'),
+            ({'capture':1_000_000, 'generation':8_999_999}, 1_000_000, 'STALE'),
+            ({'capture':1_000_000, 'generation':10_000_000,'expiry':10_000_000}, 1_000_000, 'EXPIRED'),
+            ({'capture':1_000_000, 'generation':10_400_001}, 1_000_000, 'FUTURE_TIME'),
+        ):
+            with self.subTest(code=code):
+                checker = Checker(self.anchors)
+                raw = self.packet(**changes)
+                result = checker.check(raw, 10_200_000, scene_time_us=scene)
+                self.assertEqual(result.mode, 'snapshot')
+                self.assertIn(code, result.codes)
+                self.assertEqual(checker._sources, {})
+        # Fresh pre-existing evidence is allowed on first delivery, not asserted
+        # to be a challenge-bound response. At TTL and scene-tolerance boundaries.
+        result = self.checker.check(self.packet(capture=1_300_000, generation=9_000_000),
+                                    10_000_000, scene_time_us=1_000_000)
+        self.assertEqual(result.state, 'accepted')
+
+    def test_signature_decode_region_and_sequence_windows_remain_enforced(self):
+        checker = Checker(self.anchors, replay_window=4)
+        good = self.packet(mid='good',seq=10,capture=1_000_000,generation=10_000_000)
+        self.assertEqual(checker.check(good, 10_000_000, scene_time_us=1_000_000).state,'accepted')
+        self.assertIsNone(checker.latest('pole',7))
+        bad = bytearray(self.packet(mid='forged',seq=11,capture=1_000_000,generation=10_000_000))
+        bad[-1] ^= 1
+        for raw, code in ((bytes(bad),'BAD_SIGNATURE'), (b'x','DECODE_ERROR'),
+            (self.packet(mid='old',seq=6,capture=1_000_000,generation=10_000_000),'OUTSIDE_REPLAY_WINDOW'),
+            (self.packet(mid='outside',seq=11,capture=1_000_000,generation=10_000_000,xyz=(100.,0.,0.)),
+             'OUTSIDE_PERMITTED_REGION')):
+            with self.subTest(code=code):
+                self.assertIn(code,checker.check(raw,10_000_000,scene_time_us=1_000_000).codes)
+        late=self.packet(mid='late',seq=9,capture=1_000_000,generation=10_000_000)
+        self.assertEqual(checker.check(late,10_000_000,scene_time_us=1_000_000).state,'accepted')
+        current=self.packet(mid='current',seq=11,capture=10_000_000)
+        self.assertEqual(checker.check(current,10_000_000).state,'accepted')
+        self.assertEqual(checker.latest('pole',7).envelope.message_id,'current')
+
+    def test_bad_scene_request_is_caller_error(self):
+        for scene in (-1,True,1.5,2_000_000):
+            with self.subTest(scene=scene),self.assertRaises(ValueError):
+                self.checker.check(self.packet(),1_000_000,scene_time_us=scene)
+
+
+class SnapshotCoverageTests(unittest.TestCase):
+    def test_range_packet_uses_same_snapshot_and_expiry_gates(self):
+        from dataclasses import replace
+        from test_coverage import Fixture
+        f=Fixture()
+        message=f.coverage(free={(3,1)},capture=1_000_000,expiry=12_000_000)
+        message=sign(replace(message,envelope=replace(message.envelope,generation_time_us=10_000_000)),f.keys['lidar'])
+        checker=Checker(f.anchors)
+        raw=encode(message)
+        self.assertIn('STALE',checker.check(raw,10_000_000).codes)
+        self.assertEqual(checker.check(raw,10_000_000,scene_time_us=1_000_000).state,'accepted')
+        self.assertIn('DUPLICATE',checker.check(raw,10_000_000,scene_time_us=1_000_000).codes)
+
+
+if __name__ == "__main__":
     unittest.main()
