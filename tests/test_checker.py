@@ -237,7 +237,8 @@ class EventTests(unittest.TestCase):
                     validate(self.event(**{field: value}))
 
     def test_every_event_type_and_check_code_consistency(self):
-        for event_type in EVENT_TYPES - {'check'}:
+        # S2 event types have required structured detail, tested separately.
+        for event_type in EVENT_TYPES - {'check', 'coverage_published', 'assessment', 'map_snapshot'}:
             valid = self.event(type=event_type, check_codes=[], state=None)
             validate(valid)
             for change in ({'check_codes': ['OK']}, {'state': 'accepted'}, {'state': 'rejected'}):
