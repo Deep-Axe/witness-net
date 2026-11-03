@@ -1,7 +1,9 @@
 """SAM 3.1 request builder and box-token parser (contract 7).
 
-Masks are returned as None: the probe used `<|mask;x=…;y=…;data=w,h,…|>` but
-that encoding is not independently documented and verified here.
+Grammar (dev.meta.ai/docs/sam/reading-segmentation): one line per frame,
+`<Nf>` then records `id<|box;x1;y1;x2;y2;w;h[;c]|><|mask;...|>`. Box corners
+are source pixels; w/h repeat the source size (rescaled defensively). `c` is the
+confidence when requested. Masks (base85 rasters) are not decoded: None.
 """
 
 from __future__ import annotations
@@ -13,9 +15,11 @@ import re
 from coopx.meta.client import MetaClient, ModelResult
 
 BOX_TOKEN = re.compile(
-    r"<\|box;x1=([^;]+);y1=([^;]+);x2=([^;]+);y2=([^;]+);w=([^;]+);h=([^;]+)\|>"
+    r"<\|box;x1=([^;|]+);y1=([^;|]+);x2=([^;|]+);y2=([^;|]+);w=([^;|]+);h=([^;|]+)"
+    r"(?:;c=([^;|]+))?\|>"
 )
-SAM_INSTRUCTIONS = "Segment the single noun-phrase concept. Return SAM box tokens."
+# SAM takes no instructions; the concept phrase is the whole prompt.
+SAM_INSTRUCTIONS = ""
 
 
 @dataclass(frozen=True)
@@ -43,21 +47,23 @@ def parse_sam_text(text: str, image_size: tuple[int, int]) -> list[Detection]:
     detections = []
     for match in BOX_TOKEN.finditer(text):
         try:
-            x1, y1, x2, y2, token_w, token_h = (_finite(g) for g in match.groups())
+            x1, y1, x2, y2, token_w, token_h = (_finite(g) for g in match.groups()[:6])
+            score = None if match.group(7) is None else _finite(match.group(7))
         except ValueError:
             continue
         if token_w <= 0 or token_h <= 0:
             continue
         sx, sy = width / token_w, height / token_h
         box = (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
-        detections.append(Detection(box, None, None))
+        detections.append(Detection(box, score, None))
     return detections
 
 
 def _png_data_url(image_png: bytes) -> str:
     if not isinstance(image_png, (bytes, bytearray)) or not image_png:
         raise ValueError("image_png must be nonempty bytes")
-    return "data:image/png;base64," + base64.b64encode(bytes(image_png)).decode("ascii")
+    media = "image/jpeg" if bytes(image_png[:2]) == b"\xff\xd8" else "image/png"
+    return f"data:{media};base64," + base64.b64encode(bytes(image_png)).decode("ascii")
 
 
 def segment(client: MetaClient, image_png: bytes, concept: str, *,

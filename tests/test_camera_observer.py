@@ -11,8 +11,9 @@ from coopx.dataset.v2xreal import (V2XReal, camera_footprint_xy, point_in_polygo
 from coopx.domain import ObjectClass, PositionAnchor
 from coopx.envelope import evidence_ref
 from coopx.events import validate
-from coopx.observers.camera import (CameraFrame, CameraObserver, Capability, Lifted,
-                                   Query, stub_lift_box)
+from coopx.observers.camera import CameraFrame, CameraObserver
+from coopx.observers.camera_lift import Lifted, lift_box
+from coopx.query import Capability, Query
 from coopx.meta.client import MetaClient
 from coopx.pipeline import demo_node_key
 
@@ -37,7 +38,7 @@ def _ok(text="hello", images=0):
         },
     }
 
-DATASET = Path("/home/deep/meta_hackathon/data/v2x-real/val")
+DATASET = Path(__file__).resolve().parents[1] / "data" / "v2x-real" / "val"
 SCENARIO = "2023-04-04-14-28-53_45_0"
 
 
@@ -85,11 +86,13 @@ class CameraObserverTests(unittest.TestCase):
             query = Query("q1", "T3", "rsu-2", (3.0, 4.0), 5.0, 1_250_000, "person", "look")
             cap = Capability("rsu-2", ("camera_rgb",), ("T0", "T1", "T2", "T3"), "open",
                              ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)))
-            answer = observer.on_query(query, cap)
+            answer, at_us = observer.on_query(query, cap, 1_250_000)
+            # T3 reruns SAM on receipt (cache hit replays its 250 ms latency).
+            self.assertEqual(at_us, 1_500_000)
             self.assertEqual(answer.result, "detected")
             self.assertIn(evidence_ref(messages[0]), answer.evidence_refs)
 
-    def test_stub_lift_needs_min_points(self):
+    def test_lift_needs_min_points(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             directory = root / "scene" / "1"
@@ -102,7 +105,7 @@ class CameraObserverTests(unittest.TestCase):
             np.array([[11, -1, -2, 12]], dtype="<f4").tofile(directory / "000002.bin")
             Image.new("RGB", (100, 80)).save(directory / "000002_cam1.jpeg")
             frame = V2XReal(root).read("scene", "1", "000002")
-            self.assertIsNone(stub_lift_box((0, 0, 10, 10), frame, "cam1", min_points=5))
+            self.assertIsNone(lift_box((0, 0, 10, 10), frame, "cam1", min_points=5))
 
 
 @unittest.skipUnless(DATASET.is_dir(), "V2X-Real val set is not present")

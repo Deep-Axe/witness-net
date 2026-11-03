@@ -158,9 +158,33 @@ def _usage(payload: dict) -> tuple[int, int, int, int]:
     )
 
 
+def _collect_stream(lines) -> dict:
+    """Server-sent events -> {"text", "usage", "output"} (same shape as a JSON reply)."""
+    deltas, final = [], {}
+    for raw in lines:
+        line = raw.decode("utf-8").strip() if isinstance(raw, bytes) else raw.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        event = json.loads(data)
+        kind = event.get("type")
+        if kind == "response.output_text.delta" and isinstance(event.get("delta"), str):
+            deltas.append(event["delta"])
+        elif kind in ("response.completed", "response.failed", "response.incomplete"):
+            final = event.get("response") or {}
+            if kind != "response.completed":
+                raise MetaAPIError(f"Meta API stream ended with {kind}")
+    return {"text": "".join(deltas), "usage": final.get("usage") or {},
+            "output": final.get("output") or [], "status": final.get("status")}
+
+
 def default_post(url: str, headers: dict, body: bytes, timeout: float):
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:
+        if headers.get("Accept") == "text/event-stream":
+            return response.status, _collect_stream(response)
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
@@ -229,19 +253,27 @@ class MetaClient:
     def _live_call(self, *, model: str, instructions: str, input, text_format,
                    reasoning_effort: str) -> dict:
         key = load_api_key(environ=self._environ, env_path=self._env_path)
-        payload = {
-            "model": model,
-            "instructions": instructions,
-            "input": input,
-            "reasoning": {"effort": reasoning_effort},
-            "store": False,
-        }
-        if text_format is not None:
-            payload["text"] = {"format": text_format}
+        if model == "sam-3.1":
+            # Documented SAM request: streamed, concept + image only, no
+            # instructions/reasoning (dev.meta.ai/docs/sam/segmenting).
+            payload = {"model": model, "input": input, "stream": True,
+                       "metadata": {"include_confidence": "true"}}
+            accept = "text/event-stream"
+        else:
+            payload = {
+                "model": model,
+                "instructions": instructions,
+                "input": input,
+                "reasoning": {"effort": reasoning_effort},
+                "store": False,
+            }
+            if text_format is not None:
+                payload["text"] = {"format": text_format}
+            accept = "application/json"
         body = json.dumps(payload, allow_nan=False).encode("utf-8")
         headers = {
             "Authorization": "Bearer " + key,
-            "Accept": "application/json",
+            "Accept": accept,
             "Content-Type": "application/json",
         }
         last_error = None
@@ -301,7 +333,8 @@ class MetaClient:
                 cache_hit=True, latency_ms=latency_ms,
                 input_tokens=int(cached["input_tokens"]),
                 output_tokens=int(cached["output_tokens"]),
-                images=int(cached["images"]), cost_usd=float(cached["cost_usd"]),
+                # A replay spends nothing; latency is replayed for time honesty only.
+                images=int(cached["images"]), cost_usd=0.0,
                 query_time_us=query_time_us, availability_time_us=availability,
                 precomputed=precomputed, stage=stage)
         if self.offline:

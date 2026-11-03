@@ -11,17 +11,44 @@ from coopx.meta.client import MetaClient
 from coopx.pipeline import pick_s3_frame, run_s3
 
 
-class _FakePost:
-    def __init__(self, sequence):
-        self.sequence = list(sequence)
+class _FakeMeta:
+    """Answers SAM with a recorded box token and Spark plan/judge from the request data.
+
+    The plan also proposes an unknown observer, and the judge cites an invented
+    ref: both must be rejected by the Reasoner's candidate-set validation.
+    """
+
+    def __init__(self, sam_text):
+        self.sam_text = sam_text
+        self.calls = []
+
+    @staticmethod
+    def _data(payload):
+        text = payload["input"][0]["content"][0]["text"]
+        return json.loads(text.split("\n", 1)[1].rsplit("\n", 1)[0])
 
     def __call__(self, url, headers, body, timeout):
-        item = self.sequence.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        payload = json.loads(body)
+        fmt = (payload.get("text") or {}).get("format", {}).get("name")
+        self.calls.append(fmt or payload["model"])
+        if payload["model"] == "sam-3.1":
+            return _payload(self.sam_text)
+        data = self._data(payload)
+        if fmt == "coopx_plan_v1":
+            region = data["context"]["asked_region"]
+            out = {"queries": [
+                {"tier": "T3", "observer_id": "rsu-2", "center_xy": region["center"],
+                 "radius_m": region["radius_m"], "concept": "person", "reason": "covers it"},
+                {"tier": "T1", "observer_id": "rsu-9", "center_xy": region["center"],
+                 "radius_m": 4.0, "concept": None, "reason": "invented observer"}]}
+        else:
+            ref = sorted(data["evidence"])[0]
+            out = {"verdicts": [{"subject": data["evidence"][ref]["message_id"],
+                                 "state": "corroborated",
+                                 "evidence_refs": [ref, "f" * 64], "reason": "seen by rsu-2"}]}
+        return _payload(json.dumps(out))
 
-DATASET = Path("/home/deep/meta_hackathon/data/v2x-real/val")
+DATASET = Path(__file__).resolve().parents[1] / "data" / "v2x-real" / "val"
 
 
 def _sam_text_for_gt(pick) -> str:
@@ -53,11 +80,12 @@ class S3PipelineTests(unittest.TestCase):
         pick = pick_s3_frame(DATASET)
         text = _sam_text_for_gt(pick)
         with tempfile.TemporaryDirectory() as tmp:
-            post = _FakePost([_payload(text), _payload(text)])
+            post = _FakeMeta(text)
+            ticks = iter(range(10_000))
             client = MetaClient(
                 cache_dir=Path(tmp) / "cache", cost_log=Path(tmp) / "cost.jsonl",
                 post=post, environ={"MODEL_API_KEY": "fixture-key-not-secret"},
-                clock=iter([0.0, 0.4, 1.0, 1.4]).__next__)
+                clock=lambda: next(ticks) * 0.4)
             path = Path(tmp) / "s3.jsonl"
             overlay = Path(tmp) / "overlay.png"
             summary = run_s3(path, client=client, overwrite=True, overlay=overlay,
@@ -76,6 +104,23 @@ class S3PipelineTests(unittest.TestCase):
             self.assertGreater(counts.get("answer", 0), 0)
             self.assertGreater(counts.get("verdict", 0), 0)
             self.assertGreater(summary["accepted"], 0)
+            # One SAM call (the T3 rerun is a cache hit), one plan, one judge.
+            self.assertEqual(post.calls, ["sam-3.1", "coopx_plan_v1", "coopx_judge_v1"])
+            self.assertEqual(summary["queries"], [
+                {"observer_id": "rsu-2", "tier": "T3", "concept": "person"}])
+            self.assertEqual(summary["answers"], ["detected"])
+            # One observer cannot corroborate: the model's upgrade is refused.
+            self.assertEqual([v["state"] for v in summary["verdicts"]], ["unverified"])
+            codes = {r["code"] for r in summary["reasoner_rejections"]}
+            self.assertEqual(codes, {"UNKNOWN_OBSERVER", "UNKNOWN_EVIDENCE",
+                                     "SINGLE_SOURCE_CORROBORATION"})
+            verdict = next(e for e in events if e["type"] == "verdict")
+            self.assertEqual(len(verdict["detail"]["evidence_refs"]), 1)
+            self.assertEqual(len(verdict["detail"]["model_call_ids"]), 2)
+            hits = [e for e in events if e["type"] == "model_call" and e["detail"]["cache_hit"]]
+            self.assertTrue(hits)
+            self.assertTrue(all(e["detail"]["cost_usd"] == 0 and e["detail"]["latency_ms"] > 0
+                                for e in hits))
 
             published_refs = {}
             seen_query = {}

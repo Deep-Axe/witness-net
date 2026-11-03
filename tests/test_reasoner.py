@@ -172,3 +172,55 @@ class RecordedSchemaTests(unittest.TestCase):
         self.assertEqual(len(verdicts), 1)
         self.assertEqual(verdicts[0].evidence_refs, (REF,))
         validate(verdicts[0].to_event(result.availability_time_us))
+
+
+class FreePhraseTierTests(unittest.TestCase):
+    def test_free_phrase_on_fixed_tier_is_rejected(self):
+        from types import SimpleNamespace
+        from coopx.meta.reasoner import Reasoner
+        from coopx.query import Capability
+        rows = [{"tier": "T1", "observer_id": "cam", "center_xy": [1.0, 2.0], "radius_m": 3.0,
+                 "concept": "person standing", "reason": "x"},
+                {"tier": "T3", "observer_id": "cam", "center_xy": [1.0, 2.0], "radius_m": 3.0,
+                 "concept": "person standing", "reason": "x"},
+                {"tier": "T1", "observer_id": "cam", "center_xy": [1.0, 2.0], "radius_m": 3.0,
+                 "concept": "person", "reason": "x"}]
+
+        class Client:
+            def respond(self, **kw):
+                return SimpleNamespace(json={"queries": rows}, text="", call_id="c1",
+                                       availability_time_us=kw["query_time_us"] + 1)
+        cap = Capability("cam", ("camera_rgb",), ("T0", "T1", "T2", "T3"), "open",
+                         ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0)))
+        reasoner = Reasoner(Client())
+        queries, _ = reasoner.plan("anyone?", [cap], {}, 5)
+        self.assertEqual([(q.tier, q.concept) for q in queries],
+                         [("T3", "person standing"), ("T1", "person")])
+        self.assertEqual([r["code"] for r in reasoner.rejections], ["UNSUPPORTED_CONCEPT"])
+
+
+class IndependentObserverTests(unittest.TestCase):
+    def test_corroboration_needs_two_source_ids(self):
+        from types import SimpleNamespace
+        from coopx.meta.reasoner import Reasoner
+        from coopx.query import Answer, Query
+        a, b = "a" * 64, "b" * 64
+        query = Query("q1", "T1", "cam1", (1.0, 2.0), 3.0, 5, "person", "x")
+        answers = [Answer("q1", "cam1", "detected", 5, None, (a,))]
+
+        def judge_with(refs, evidence):
+            class Client:
+                def respond(self, **kw):
+                    return SimpleNamespace(
+                        json={"verdicts": [{"subject": "q1", "state": "corroborated",
+                                            "evidence_refs": refs, "reason": "seen"}]},
+                        text="", call_id="j1", availability_time_us=kw["query_time_us"] + 1)
+            verdicts, _ = Reasoner(Client()).judge("anyone?", [query], answers, evidence, 10)
+            return verdicts[0].state
+
+        one = {a: {"source_id": "cam1", "availability_time_us": 5}}
+        two = {**one, b: {"source_id": "cam2", "availability_time_us": 5}}
+        same = {**one, b: {"source_id": "cam1", "availability_time_us": 5}}
+        self.assertEqual(judge_with([a], one), "unverified")
+        self.assertEqual(judge_with([a, b], same), "unverified")
+        self.assertEqual(judge_with([a, b], two), "corroborated")

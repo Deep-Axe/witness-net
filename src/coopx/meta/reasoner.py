@@ -13,8 +13,8 @@ from dataclasses import asdict
 import json
 import re
 
-from coopx.query import (Answer, Capability, MAX_QUERIES, MAX_RADIUS_M, Query,
-                        STATES, TIERS, Verdict)
+from coopx.query import (Answer, CLASS_CONCEPTS, Capability, MAX_QUERIES, MAX_RADIUS_M,
+                        Query, STATES, TIERS, Verdict, normalize_concept)
 
 PLAN_FORMAT = {'type': 'json_schema', 'name': 'coopx_plan_v1', 'strict': True,
     'schema': {'type': 'object', 'additionalProperties': False, 'required': ['queries'],
@@ -112,7 +112,9 @@ class Reasoner:
         result = self.client.respond(model=self.model,
             instructions=INSTRUCTIONS+f' Plan at most {self.max_queries} useful observer queries. '
                 'Prefer T1 for a region snapshot, T2 for targeted verification, '
-                'and T3 for a new concept on an open-vocabulary observer; T0 is subscription/discovery.',
+                'and T3 for a new concept on an open-vocabulary observer; T0 is subscription/discovery. '
+                'For T0-T2 the concept must be null or one fixed class word: '
+                + ', '.join(sorted(CLASS_CONCEPTS)) + '. Any other noun phrase needs T3.',
             input=_json_input({'question': question, 'capabilities': [asdict(c) for c in capabilities],
                                'context': context, 'max_queries': self.max_queries}),
             query_time_us=now_us, text_format=PLAN_FORMAT, reasoning_effort='minimal', stage='plan')
@@ -135,6 +137,12 @@ class Reasoner:
                     continue
                 if query.tier not in capability.query_tiers or (query.tier == 'T3' and capability.vocabulary != 'open'):
                     self._reject('plan', 'UNSUPPORTED_TIER', index)
+                    continue
+                if (query.tier != 'T3' and query.concept is not None
+                        and normalize_concept(query.concept) not in CLASS_CONCEPTS):
+                    # A fixed-class tier cannot match a free phrase; it would
+                    # report not_detected for something it never looked for.
+                    self._reject('plan', 'UNSUPPORTED_CONCEPT', index)
                     continue
                 if query.time_us > now_us:
                     raise ValueError('future scene time')
@@ -167,7 +175,9 @@ class Reasoner:
         for ref, summary in visible.items():
             subjects.update(_subjects(ref, summary))
         result = self.client.respond(model=self.model,
-            instructions=INSTRUCTIONS+' Judge the supplied answers. Choose subjects from candidate_subjects.',
+            instructions=INSTRUCTIONS+' Judge the supplied answers. Choose subjects from candidate_subjects. '
+                'corroborated and contested need evidence from at least two different source_id '
+                'observers; one observer\'s detection alone is unverified (detected, single source).',
             input=_json_input({'question': question, 'queries': [asdict(q) for q in queries],
                 'answers': [asdict(a) for a in answers], 'evidence': visible,
                 'candidate_subjects': sorted(subjects)}), query_time_us=now_us,
@@ -199,6 +209,14 @@ class Reasoner:
                 refs = tuple(dict.fromkeys(accepted))
                 state = row['state'] if refs or row['state'] == 'unverified' else 'unverified'
                 reason = row['reason'] if refs else 'UNVERIFIED: no valid cited evidence.'
+                sources = {visible[ref].get('source_id') for ref in refs}
+                if state in ('corroborated', 'contested') and (None in sources or len(sources) < 2):
+                    # Count independent observers, not messages: a model may not
+                    # upgrade trust beyond what the cited evidence supports.
+                    self._reject('judge', 'SINGLE_SOURCE_CORROBORATION', index)
+                    state = 'unverified'
+                    reason = 'UNVERIFIED: single source. ' + row['reason']
+                    reason = reason[:1024]
                 verdicts.append(Verdict(f'v-{result.call_id}-{now_us}-{index}', row['subject'],
                     state, refs, reason, calls))
             except (ValueError, TypeError, KeyError):

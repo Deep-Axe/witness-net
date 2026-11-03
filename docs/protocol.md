@@ -8,9 +8,13 @@ admission checker with a bounded replay window (`src/coopx/checker.py`), a
 binary packet transport with end-to-end S1 and S2 runs (`src/coopx/pipeline.py`),
 signed coverage messages as three row-major bitmaps (observed, free, occupied;
 magic `CX2C`) with a per-source coverage map (`src/coopx/coverage.py`), and
-deterministic assessment of admitted observations (`src/coopx/assess.py`).
-Other message-body codecs (coverage, query, answer, verdict, capability, label
-table), coverage/free-space checks and advisories remain specified, not built.
+deterministic assessment of admitted observations (`src/coopx/assess.py`),
+typed capabilities, T0–T3 queries, six-result answers and verdicts as in-process
+records and log events (`src/coopx/query.py`), and a Muse Spark plan → execute →
+judge Reasoner that validates every query and cited reference against what it
+was shown (`src/coopx/meta/reasoner.py`). Signed wire codecs for queries,
+answers, verdicts, capabilities and label tables, and hazard advisories, remain
+specified, not built.
 
 > Give any robot access to the senses around it. Machines discover observers,
 > ask about the world, and cross-check the answers, even when the robot has no

@@ -29,3 +29,21 @@ class SamParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SamDocumentedGrammarTests(unittest.TestCase):
+    def test_confidence_and_multi_record_line(self):
+        text = ("<0f>0<|box;x1=10;y1=20;x2=30;y2=60;w=100;h=80;c=0.91|><|mask;x=0;y=0;c=0.91;data=2,2,~abc|>,"
+                "3<|box;x1=50;y1=5;x2=70;y2=40;w=100;h=80;c=0.42|><|mask;x=0;y=0;c=0.42;data=2,2,~abc|>")
+        boxes = parse_sam_text(text, (100, 80))
+        self.assertEqual([d.box_xyxy for d in boxes], [(10.0, 20.0, 30.0, 60.0), (50.0, 5.0, 70.0, 40.0)])
+        self.assertEqual([d.score for d in boxes], [0.91, 0.42])
+
+    def test_stream_collection(self):
+        from coopx.meta.client import _collect_stream
+        lines = [b'event: x', b'data: {"type":"response.output_text.delta","delta":"<0f>0<|box;"}',
+                 b'data: {"type":"response.output_text.delta","delta":"x1=1;y1=2;x2=3;y2=4;w=9;h=9|>"}',
+                 b'data: {"type":"response.completed","response":{"usage":{"images_processed":1}}}']
+        out = _collect_stream(lines)
+        self.assertEqual(len(parse_sam_text(out["text"], (9, 9))), 1)
+        self.assertEqual(out["usage"]["images_processed"], 1)

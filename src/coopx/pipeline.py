@@ -497,8 +497,7 @@ def run_s2(output: Path, *, seed: int = 0, loss: float = 0.0, delay_us: int = 10
 
 
 # ---------------------------------------------------------------------------
-# S3: one dataset frame, SAM observer, stub Reasoner
-# Seams (reviewer swaps in Agent A): _s3_reasoner, _s3_answer, _s3_lift
+# S3: one dataset frame, SAM observer, Muse Spark Reasoner (plan -> execute -> judge)
 # ---------------------------------------------------------------------------
 
 S3_SCENARIO = "2023-04-04-14-28-53_45_0"
@@ -508,7 +507,7 @@ S3_EGO = "2"
 S3_NODES = ("rsu-2", "rsu-1", "ego")
 S3_SESSION = "s3"
 S3_TTL_US = 5_000_000
-S3_DATASET = Path("/home/deep/meta_hackathon/data/v2x-real/val")
+S3_DATASET = Path(__file__).resolve().parents[2] / "data" / "v2x-real" / "val"
 S3_OVERLAY = Path("data/s3/overlay.png")
 S3_REGION = (-1000.0, -1000.0, -50.0, 1000.0, 1000.0, 80.0)
 _S3_PICK_CACHE = {}
@@ -524,103 +523,6 @@ class S3FramePick:
     pedestrian_id: str
     other_camera: str
     other_rsu_id: str
-
-
-@dataclass(frozen=True)
-class Verdict:
-    verdict_id: str
-    subject: str
-    state: str
-    evidence_refs: tuple[str, ...]
-    reason: str
-    model_call_ids: tuple[str, ...]
-
-
-def _s3_lift():
-    """Seam: replace with `from coopx.observers.camera_lift import lift_box`."""
-    from coopx.observers.camera import stub_lift_box
-    return stub_lift_box
-
-
-def _s3_answer():
-    """Seam: replace with `from coopx.query import answer_query`."""
-    from coopx.observers.camera import stub_answer_query
-    return stub_answer_query
-
-
-class StubReasoner:
-    """Plan one T3 person query at the covering observer; judge from answers.
-
-    Makes no paid Spark calls (precomputed ModelResult, cost 0).
-    """
-
-    def __init__(self, client, *, model="muse-spark-1.3", max_queries=4):
-        self.client = client
-        self.model = model
-        self.max_queries = max_queries
-
-    def _result(self, now_us: int, stage: str, call_id: str):
-        from coopx.meta.client import ModelResult
-        return ModelResult(
-            text=f"stub {stage}", json=None, call_id=call_id, product=self.model,
-            cache_hit=False, latency_ms=0.0, input_tokens=0, output_tokens=0,
-            images=0, cost_usd=0.0, query_time_us=now_us,
-            availability_time_us=now_us, precomputed=True, stage=stage)
-
-    def plan(self, question: str, capabilities, context: dict, now_us: int):
-        from coopx.dataset.v2xreal import point_in_polygon
-        from coopx.observers.camera import Query
-        region = context["region"]
-        center = tuple(region["center"])
-        chosen = next((cap for cap in capabilities
-                       if point_in_polygon(center, cap.coverage_xy)), capabilities[0])
-        query = Query(
-            "q-s3-0", "T3", chosen.observer_id, center, float(region["radius_m"]),
-            now_us, "person", "footprint covers the asked region")
-        return [query], self._result(now_us, "plan", "stub-plan")
-
-    def judge(self, question: str, queries, answers, evidence: dict, now_us: int):
-        refs = []
-        for answer in answers:
-            if answer.result == "detected":
-                refs.extend(answer.evidence_refs)
-        refs = tuple(dict.fromkeys(refs))
-        state = "corroborated" if refs else "unverified"
-        reason = ("stub judge: detections cited" if refs
-                  else "stub judge: no detected evidence")
-        return ([Verdict("v-s3-0", "region-pedestrian", state, refs, reason, ())],
-                self._result(now_us, "judge", "stub-judge"))
-
-
-def _s3_reasoner(client):
-    """Seam: replace with `from coopx.meta.reasoner import Reasoner`."""
-    return StubReasoner(client)
-
-
-def stub_execute(queries, capabilities, observers, *, max_queries=4):
-    """Validate every query before calling any observer (contract 9 execute)."""
-    if len(queries) > max_queries:
-        raise ValueError("too many queries")
-    by_id = {cap.observer_id: cap for cap in capabilities}
-    answers = []
-    for query in queries:
-        cap = by_id.get(query.observer_id)
-        if cap is None or query.observer_id not in observers:
-            continue
-        if query.tier not in cap.query_tiers:
-            from coopx.observers.camera import Answer
-            answers.append(Answer(query.query_id, query.observer_id, "unsupported",
-                                  None, None, ()))
-            continue
-        if not all(math.isfinite(v) for v in query.center_xy) or query.radius_m <= 0:
-            continue
-        answers.append(observers[query.observer_id](query))
-    return answers
-
-
-def _s3_execute():
-    """Seam: replace with `from coopx.meta.reasoner import execute`."""
-    return stub_execute
 
 
 def pick_s3_frame(dataset_root: Path = S3_DATASET, *,
@@ -702,53 +604,23 @@ def _write_s3_overlay(path: Path, frame, camera_name: str, detections, gt_box) -
     image.save(path)
 
 
-def _query_event(query, now_us: int) -> dict:
-    return make_event(
-        t_replay_us=now_us, type="query", source_id="reasoner",
-        dest_id=query.observer_id, message_id=query.query_id, message_type="query",
-        detail={
-            "tier": query.tier,
-            "region": {"center": [query.center_xy[0], query.center_xy[1]],
-                       "radius_m": query.radius_m},
-            "time_us": query.time_us, "concept": query.concept, "reason": query.reason,
-        })
-
-
-def _answer_event(answer, now_us: int) -> dict:
-    return make_event(
-        t_replay_us=now_us, type="answer", source_id=answer.observer_id,
-        dest_id="reasoner", message_id=answer.query_id, message_type="answer",
-        state=answer.result,
-        detail={
-            "observed_time_us": answer.observed_time_us,
-            "coverage_ref": answer.coverage_ref,
-            "evidence_refs": list(answer.evidence_refs),
-        })
-
-
-def _verdict_event(verdict, now_us: int) -> dict:
-    return make_event(
-        t_replay_us=now_us, type="verdict", source_id="reasoner",
-        message_id=verdict.verdict_id, message_type="verdict", state=verdict.state,
-        detail={
-            "subject": verdict.subject,
-            "evidence_refs": list(verdict.evidence_refs),
-            "reason": verdict.reason,
-            "model_call_ids": list(verdict.model_call_ids),
-        })
-
-
 def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
            budget_usd: float = 3.0, overwrite: bool = False,
            dataset_root: Path = S3_DATASET, client=None,
            delay_us: int = 100_000, overlay: Path = S3_OVERLAY) -> dict:
-    """One V2X-Real frame: SAM fast path, then a stub-planned region question."""
-    from coopx.dataset.v2xreal import V2XReal
+    """One V2X-Real frame: SAM fast path, then a Spark-planned, Spark-judged question.
+
+    The fast path (SAM -> lift -> checker -> assessment) never waits on Spark;
+    every model result enters the log at its availability time.
+    """
+    from coopx.dataset.v2xreal import V2XReal, camera_footprint_xy, point_in_polygon
     from coopx.envelope import encode, evidence_ref
-    from coopx.meta.client import MetaClient
-    from coopx.dataset.v2xreal import camera_footprint_xy, point_in_polygon
+    from coopx.meta.client import MetaClient, model_call_event
+    from coopx.meta.reasoner import Reasoner, execute
     from coopx.observers.camera import (CameraObserver, jpeg_to_camera_frame,
                                        rsu_camera_capability)
+    from coopx.observers.camera_lift import lift_box
+    from coopx.query import answer_query
 
     pick = pick_s3_frame(dataset_root)
     dataset = V2XReal(dataset_root)
@@ -787,8 +659,6 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
 
     if client is None:
         client = MetaClient(budget_usd=budget_usd, offline=offline)
-    lift_fn = _s3_lift()
-    answer_fn = _s3_answer()
     events: list[dict] = []
     accepted = rejected = 0
     admitted: list = []
@@ -819,49 +689,18 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         return jpeg_to_camera_frame(rsu, pick.camera_name)
 
     observer = CameraObserver(
-        "rsu-2", frame_source, pick.camera_name, client, lift_fn, keys["rsu-2"],
-        session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_fn)
-    published = observer.observe()
-    events.extend(observer.drain_events())
-    publish_us = published[0].envelope.generation_time_us if published else rsu.nominal_time_us
-    for message in published:
-        raw = encode(message)
-        events.append(make_event(
-            t_replay_us=message.envelope.generation_time_us, type="observation_published",
-            source_id="rsu-2", message_id=message.envelope.message_id,
-            message_type="observation", evidence_ref=evidence_ref(message),
-            bytes=len(raw),
-            detail={"xyz": list(message.observation.xyz_m),
-                    "cls": message.observation.cls.name,
-                    "sensor_seq": message.envelope.sensor_seq}))
-        transport.send("rsu-2", raw, sim_us=message.envelope.generation_time_us,
-                       message_id=message.envelope.message_id, message_type="observation")
-        publish_us = max(publish_us, message.envelope.generation_time_us)
-
-    drain_us = publish_us + delay_us
-    transport.receive_until(drain_us)
-    events.append(_map_snapshot_event(coverage_map, drain_us))
-
-    t_q = drain_us
-    question = "Is anyone in the crosswalk ahead of the ego?"
-    context = {"region": {"center": [center[0], center[1]], "radius_m": 4.0},
-               "admitted": len(admitted)}
-    reasoner = _s3_reasoner(client)
-    queries, plan_result = reasoner.plan(question, capabilities, context, t_q)
-    from coopx.meta.client import model_call_event
-    if not plan_result.precomputed:
-        events.append(model_call_event(plan_result, "reasoner"))
-    plan_avail = plan_result.availability_time_us
-    for query in queries:
-        events.append(_query_event(query, plan_avail))
+        "rsu-2", frame_source, pick.camera_name, client, lift_box, keys["rsu-2"],
+        session=S3_SESSION, ttl_us=S3_TTL_US, answer_fn=answer_query)
+    published_refs: dict[str, ObservationMessage] = {}
 
     def publish_message(message) -> None:
         raw = encode(message)
+        ref = evidence_ref(message)
+        published_refs[ref] = message
         events.append(make_event(
             t_replay_us=message.envelope.generation_time_us, type="observation_published",
             source_id=message.envelope.source_id, message_id=message.envelope.message_id,
-            message_type="observation", evidence_ref=evidence_ref(message),
-            bytes=len(raw),
+            message_type="observation", evidence_ref=ref, bytes=len(raw),
             detail={"xyz": list(message.observation.xyz_m),
                     "cls": message.observation.cls.name,
                     "sensor_seq": message.envelope.sensor_seq}))
@@ -869,34 +708,83 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
                        sim_us=message.envelope.generation_time_us,
                        message_id=message.envelope.message_id, message_type="observation")
 
+    # Fast path: SAM at the observer -> lift -> signed observations -> checker.
+    capture_us = rsu.nominal_time_us
+    published = observer.observe()
+    events.extend(observer.drain_events())
+    publish_us = capture_us
+    for message in published:
+        publish_message(message)
+        publish_us = max(publish_us, message.envelope.generation_time_us)
+    drain_us = max(publish_us, observer.last_result.availability_time_us
+                   if observer.last_result else publish_us) + delay_us
+    transport.receive_until(drain_us)
+    events.append(_map_snapshot_event(coverage_map, drain_us))
+
+    # Supervisory path: question -> Spark plan -> execute -> answers -> Spark judge.
+    t_q = drain_us
+    question = ("Is anyone standing in the asked region (a crossing area near the ego)? "
+                "Use the observers that can see it.")
+    region = {"center": [round(center[0], 2), round(center[1], 2)], "radius_m": 4.0}
+    ego_xy = [round(float(ego.lidar_to_site[0, 3]), 2), round(float(ego.lidar_to_site[1, 3]), 2)]
+    context = {
+        "time_us": capture_us,
+        "asked_region": region,
+        "ego_xy": ego_xy,
+        "admitted_objects": [
+            {"source_id": m.envelope.source_id, "class": m.observation.cls.name,
+             "xy": [round(m.observation.xyz_m[0], 2), round(m.observation.xyz_m[1], 2)]}
+            for m in admitted],
+    }
+    reasoner = Reasoner(client)
+    queries, plan_result = reasoner.plan(question, capabilities, context, t_q)
+    events.append(model_call_event(plan_result, "reasoner"))
+    plan_avail = plan_result.availability_time_us
+    for query in queries:
+        events.append(query.to_event(plan_avail))
+
+    answer_times: dict[str, int] = {}
+
     def call_rsu2(query):
         before = len(observer._admitted)
-        answer = observer.on_query(query, cap_rsu)
+        answer, at_us = observer.on_query(query, cap_rsu, plan_avail)
         for message in observer._admitted[before:]:
             publish_message(message)
+        answer_times[query.query_id] = at_us
         return answer
 
     def call_rsu1(query):
-        return answer_fn(query, cap_other, [], [], query.time_us)
+        # rsu-1 shares nothing in this frame: it can only say not_covered/unavailable.
+        answer_times[query.query_id] = plan_avail
+        return answer_query(query, cap_other, [], [], plan_avail)
 
-    execute = _s3_execute()
     answers = execute(queries, capabilities, {"rsu-2": call_rsu2, "rsu-1": call_rsu1})
     events.extend(observer.drain_events())
-    answer_us = plan_avail
-    for extra in events:
-        if extra["type"] in ("model_call", "observation_published"):
-            answer_us = max(answer_us, extra["t_replay_us"])
-    later = answer_us + delay_us
-    transport.receive_until(later)
+    answers_us = plan_avail
     for answer in answers:
-        events.append(_answer_event(answer, max(answer_us, later)))
+        at_us = answer_times.get(answer.query_id, plan_avail) + delay_us
+        events.append(answer.to_event(at_us))
+        answers_us = max(answers_us, at_us)
+    transport.receive_until(answers_us)
 
-    verdicts, judge_result = reasoner.judge(question, queries, answers, {}, answer_us)
-    if not judge_result.precomputed:
-        events.append(model_call_event(judge_result, "reasoner"))
-    judge_avail = max(answer_us, judge_result.availability_time_us)
+    evidence = {}
+    for answer in answers:
+        for ref in answer.evidence_refs:
+            message = published_refs.get(ref)
+            if message is None:
+                continue
+            o = message.observation
+            evidence[ref] = {
+                "source_id": message.envelope.source_id, "object_id": o.object_id,
+                "message_id": message.envelope.message_id, "class": o.cls.name,
+                "xy": [round(o.xyz_m[0], 2), round(o.xyz_m[1], 2)],
+                "capture_time_us": message.envelope.capture_time_us,
+                "availability_time_us": message.envelope.generation_time_us,
+            }
+    verdicts, judge_result = reasoner.judge(question, queries, answers, evidence, answers_us)
+    events.append(model_call_event(judge_result, "reasoner"))
     for verdict in verdicts:
-        events.append(_verdict_event(verdict, judge_avail))
+        events.append(verdict.to_event(judge_result.availability_time_us))
 
     try:
         _write_s3_overlay(overlay, rsu, pick.camera_name, observer.last_detections, pedestrian)
@@ -925,4 +813,10 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
         "grid": _grid_dict(grid),
         "checker": type(checker).__name__,
         "reasoner": type(reasoner).__name__,
+        "queries": [{"observer_id": q.observer_id, "tier": q.tier, "concept": q.concept}
+                    for q in queries],
+        "answers": [a.result for a in answers],
+        "verdicts": [{"subject": v.subject, "state": v.state, "refs": len(v.evidence_refs)}
+                     for v in verdicts],
+        "reasoner_rejections": list(reasoner.rejections),
     }

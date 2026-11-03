@@ -57,14 +57,15 @@ Details: [protocol draft](docs/protocol.md) ·
 | Protocol and security design | Draft v0.2 |
 | Compact object record (CX1, 84 bytes), delayed transport, stale detection, depth lifting | Implemented on synthetic data |
 | CX2 signed observations, Ed25519 identities, authenticated lineage and witness accounting | Implemented; round-trip, tampering, relay and dependency tests pass |
-| Meta API access (Spark JSON + function calls, SAM image/video, Voice) | Verified with small probes; not yet integrated |
+| Meta API access (Spark JSON + function calls, SAM image/video, Voice) | Spark 1.3 and SAM 3.1 integrated in S3 (cached client with cost log and budget); Voice probed only |
 | Deterministic checker (signature, freshness, future time, duplicates, bounded replay window, bounds) | Implemented; honest reordered traffic accepted, replay/forgery rejected |
 | S1 slice: signed observations → packet transport (delay, jitter, loss, disconnect) → checker → JSONL event log → browser viewer | Implemented; tested end to end; viewer renders log text safely |
-| S2 slice: signed LiDAR coverage (`CX2C` bitmaps), per-source coverage map with contested cells, deterministic assessment (contradicted by free space, position-only support, unverified) | Implemented on a synthetic 2-D world, no LLM; a ghost in LiDAR free space is contradicted, a ghost where no range sensor looks stays unverified |
+| S2 slice: signed LiDAR coverage (`CX2C` bitmaps), per-source coverage map with contested cells, deterministic assessment (contradicted by free space, position-only support, contested, unverified) | Implemented on a synthetic 2-D world, no LLM; a ghost in LiDAR free space is contradicted, a ghost where no range sensor looks stays unverified, two cameras against LiDAR free space are contested |
+| S3 slice: one V2X-Real frame; SAM 3.1 at an infrastructure camera; detections lifted with that observer's LiDAR; signed, checked; Muse Spark plans queries, observers answer, Spark judges with evidence refs | Implemented; one live run on one frame (scenario `2023-04-04-14-28-53_45_0`, frame 000096). Lifted pedestrian 0.16 m from GT. Model verdicts cannot exceed the evidence (one observer is never "corroborated") |
 | V2X-Real reader and projection calibration | Implemented; three frames, six cameras, and RSU → vehicle projections inspected; capture synchronization unproven |
-| Tests | 147 passing |
+| Tests | 203 passing (no network; recorded/fake model responses) |
 | Dataset replay ([V2X-Real](https://mobility-lab.seas.ucla.edu/v2x-real/) validation split) | Data extracted; replay integration pending |
-| Muse Reasoner, SAM observer, attacks, evaluation, full demo UI | Not started |
+| Scene mining, attacks, evaluation, multi-frame replay, full demo UI | Not started |
 
 A successful synthetic run does not imply the dataset or model integrations work.
 
@@ -85,7 +86,7 @@ Slice S1 (signed observations through a lossy, jittery link to a checking
 consumer) and its viewer:
 
 ```sh
-.venv/bin/python -m coopx s1 --output data/s1-events.jsonl --loss 0.1 --jitter-us 150000 --disconnect-at-us 3000000
+.venv/bin/python -m coopx s1 --output data/s1-events.jsonl --overwrite --loss 0.1 --jitter-us 150000 --disconnect-at-us 3000000
 .venv/bin/python scripts/serve_ui.py      # localhost only; serves ui/ and data/*.jsonl, never .env
 # open http://127.0.0.1:8765/ui/index.html?log=/data/s1-events.jsonl
 ```
@@ -95,7 +96,7 @@ contested cell on the map to see the LiDAR free claim and the ghost's
 occupied claim:
 
 ```sh
-.venv/bin/python -m coopx s2 --output data/s2-events.jsonl --key-seed 1
+.venv/bin/python -m coopx s2 --output data/s2-events.jsonl --overwrite --key-seed 1
 # open http://127.0.0.1:8765/ui/index.html?log=/data/s2-events.jsonl
 ```
 
@@ -104,6 +105,19 @@ refuses to overwrite an existing file. Expected: a synthetic masked depth plane
 becomes a world-space observation, encodes to 84 ASCII bytes, and crosses a
 delayed transport (168 bytes sent and received for two transmissions). The
 repeated packet keeps its capture time, so the later delivery is stale.
+
+Slice S3 (one dataset frame; needs the V2X-Real validation split under
+`data/v2x-real/val` and `MODEL_API_KEY`; makes one SAM call and two Spark calls,
+about $0.01 at published rates, then replays from `data/meta-cache/` for free):
+
+```sh
+.venv/bin/python -m coopx s3 --output data/s3-events.jsonl --overwrite --budget-usd 0.5
+.venv/bin/python -m coopx s3 --output data/s3-events.jsonl --overwrite --offline   # cache only
+# open http://127.0.0.1:8765/ui/index.html?log=/data/s3-events.jsonl
+```
+
+Paid calls are logged to `data/cost-log.jsonl`. Cached replays report the
+original measured latency, so a replay is never shown as instant.
 
 Meta API access check (reads `MODEL_API_KEY` from the environment or `.env`):
 
