@@ -269,7 +269,21 @@ class Reasoner:
                         accepted.append(ref)
                 refs = tuple(dict.fromkeys(accepted))
                 state = row['state'] if refs or row['state'] == 'unverified' else 'unverified'
-                reason = row['reason'] if refs else 'UNVERIFIED: no valid cited evidence.'
+                if refs:
+                    reason = row['reason']
+                else:
+                    state = 'unverified'
+                    if not row['evidence_refs']:
+                        # No citation was offered. Keep the model's sentence so the
+                        # downgrade does not hide why the verdict was empty.
+                        self._reject('judge', 'NO_VALID_CITATION', index)
+                        reason = ('Downgraded: the judge cited no evidence, so this stays unverified. '
+                                  + row['reason'])[:1024]
+                    else:
+                        # Rejected citations stay out of the text. The model sentence
+                        # is untrusted once its references are not in the record.
+                        reason = ('Downgraded: the cited evidence is not in the supplied record, '
+                                  'so this stays unverified.')
                 # A model may not upgrade trust beyond what the cited evidence
                 # supports: count independent witnesses, not messages or IDs.
                 support = [ref for ref in refs if ref in supporting

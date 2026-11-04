@@ -19,18 +19,21 @@ def allowed(url_path: str) -> bool:
     path = unquote(urlsplit(url_path).path)
     if path in ("", "/"):
         return True
-    target = (ROOT / path.lstrip("/")).resolve()
-    try:
-        relative = target.relative_to(ROOT)
-    except ValueError:
-        return False
+    relative = Path(path.lstrip("/"))
     parts = relative.parts
-    if not parts or any(part.startswith(".") for part in parts):
+    if not parts or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
         return False
     if parts[0] == "ui":
         return True
-    return (parts[0] == "data" and len(parts) > 1 and parts[1] != "v2x-real"
-            and target.suffix in DATA_SUFFIXES)
+    if not (parts[0] == "data" and len(parts) > 1 and parts[1] != "v2x-real"):
+        return False
+    # data/ may be a symlink to the shared dataset directory.
+    target = (ROOT / relative).resolve()
+    try:
+        target.relative_to((ROOT / "data").resolve())
+    except ValueError:
+        return False
+    return target.suffix in DATA_SUFFIXES
 
 
 class Handler(SimpleHTTPRequestHandler):

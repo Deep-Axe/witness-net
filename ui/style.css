@@ -40,6 +40,14 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
 
 .timeline { display: flex; gap: 12px; align-items: center; padding: 8px 16px; }
 .timeline input { flex: 1; }
+.badge { border: 1px solid var(--warn); color: var(--warn); border-radius: 999px; padding: 4px 10px; font-size: 12px; white-space: nowrap; }
+.badge.snapshot { border-color: var(--accent); color: var(--accent); }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 0 16px 10px; }
+.controls input[type="text"], .controls select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.beats { display: flex; flex-wrap: wrap; gap: 4px; }
+.beats button, .controls button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; cursor: pointer; }
+.tag-live { color: var(--warn); }
+.tag-cache { color: var(--ok); }
 button { background: var(--accent); color: #041018; border: 0; border-radius: 6px; padding: 6px 12px; font-weight: 600; cursor: pointer; }
 
 .grid {

@@ -135,6 +135,13 @@ def main() -> None:
                         help="Required to append a release row")
     ledger.add_argument("--reason", default="")
     ledger.add_argument("--ledger", type=Path, default=Path("data/cost-log.jsonl"))
+    demo = sub.add_parser("demo", help="S4b: two approved clips, snapshot Q&A, attacks")
+    demo.add_argument("--output", type=Path, default=Path("data/s4b-agent-b/demo-events.jsonl"))
+    demo.add_argument("--overwrite", action="store_true")
+    demo.add_argument("--offline", action="store_true")
+    demo.add_argument("--budget-usd", type=float, default=5.0)
+    demo.add_argument("--no-compare", action="store_true",
+                      help="Skip Muse-versus-geo on the attacks geo misses")
     args = parser.parse_args()
     try:
         if args.command == "synthetic":
@@ -158,6 +165,10 @@ def main() -> None:
                               out_dir=args.output_dir, perception=args.perception)
             write_summary(args.output_dir, args.summary)
             result["summary"] = str(args.summary)
+        elif args.command == "demo":
+            from coopx.pipeline import run_demo
+            result = run_demo(args.output, overwrite=args.overwrite, offline=args.offline,
+                              budget_usd=args.budget_usd, compare=not args.no_compare)
         elif args.command == "ledger":
             from coopx.meta.client import MetaClient
             client = MetaClient(cost_log=args.ledger, budget_usd=1.0, environ={}, offline=True)
