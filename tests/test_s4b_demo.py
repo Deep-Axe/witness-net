@@ -59,6 +59,46 @@ class GhostWitnessTests(unittest.TestCase):
         self.assertEqual(witness_count(store, [message]), 0)
 
 
+class LocalDetectionTests(unittest.TestCase):
+    def test_local_detections_are_present_and_survive_on_both_clips(self):
+        from coopx.eval.fusion import MAX_PREDICTION_US
+        from coopx.pipeline import DEMO_CLIPS, _demo_clip
+        for index, clip in enumerate(DEMO_CLIPS):
+            part = _demo_clip(clip, index, offline=True, budget_usd=5, key_seed=0, client=None)
+            self.assertLess(part["decision_age_us"], MAX_PREDICTION_US, clip["name"])
+            for kind in ("ghost_free", "remote_clear"):
+                note = part["attacks"][kind]
+                self.assertGreater(note["local_count"], 0, clip["name"] + " " + kind)
+                self.assertTrue(note["local_kept"], clip["name"] + " " + kind)
+                self.assertGreater(note["tracked_local_count"], 0, clip["name"] + " " + kind)
+                self.assertTrue(note["tracked_local_kept"], clip["name"] + " " + kind)
+
+
+class CitationDowngradeTests(unittest.TestCase):
+    def test_empty_citation_is_downgraded_and_the_reason_stays(self):
+        from types import SimpleNamespace
+        from coopx.eval.muse_compare import judge_with_evidence
+        ref = "ab" * 32
+        queries = [Query("q1", "T1", "cam", (0.0, 0.0), 2.0, 1_000_000, "person", "look")]
+        answers = [Answer("q1", "cam", "not_detected", None, None, ())]
+        evidence = {ref: {"source_id": "cam", "xy": [0.0, 0.0], "availability_time_us": 1_000_000}}
+
+        class Client:
+            def respond(self, **kwargs):
+                return SimpleNamespace(
+                    json={"verdicts": [{"subject": "q1", "state": "unverified",
+                                        "evidence_refs": [],
+                                        "reason": "Ego not_detected alone does not prove free space."}]},
+                    text="", call_id="j", availability_time_us=kwargs["query_time_us"] + 1)
+
+        verdicts, _ = judge_with_evidence(
+            Client(), lambda *_args: False, "question", queries, answers, evidence, 2_000_000)
+        self.assertEqual(verdicts[0].state, "unverified")
+        self.assertEqual(verdicts[0].evidence_refs, ())
+        self.assertIn("Downgraded", verdicts[0].reason)
+        self.assertIn("Ego not_detected alone", verdicts[0].reason)
+
+
 class MuseEvidenceTests(unittest.TestCase):
     def test_contradicted_stands_only_when_the_callback_is_true(self):
         from types import SimpleNamespace

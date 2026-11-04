@@ -1065,8 +1065,8 @@ def range_contradicts_callback(store, coverage_map, clock):
 
 
 DEMO_CLIPS = (
-    {"name": "blos_pedestrian_001", "frame": "000029", "gt_id": "81"},
     {"name": "blos_pedestrian_002", "frame": "000000", "gt_id": "138"},
+    {"name": "blos_pedestrian_001", "frame": "000029", "gt_id": "81"},
 )
 DEMO_QUESTION = ("Is a pedestrian hidden from the car but visible from a roadside camera?")
 # Operator-selected regions. Centres are inside the roadside footprint and are
@@ -1099,9 +1099,83 @@ def witness_count(store, messages) -> int:
     return max(store.independent_witnesses(m, observations) for m in observations)
 
 
+def _untracked_trace(scene_name: str) -> Path:
+    """Tracking adds false hazards, so the viewer reads the untracked trace."""
+    untracked = (Path("data/s4b-agent-a/release/ablation/untracked/sam")
+                 / scene_name / "witness.jsonl")
+    if untracked.is_file():
+        return untracked
+    return Path("data/results/sam") / scene_name / "ego.jsonl"
+
+
+def _tracked_trace(scene_name: str) -> Path:
+    return (Path("data/s4b-agent-a/release/sweep/SAM-with-tracking/tau-0/sam")
+            / scene_name / "witness.jsonl")
+
+
+def demo_decision_us(capture_us: int, messages) -> int:
+    """Fusion time after these observations exist and before the prediction cap."""
+    from coopx.eval.fusion import MAX_PREDICTION_US
+    if not messages:
+        return int(capture_us)
+    ready = max(message.envelope.generation_time_us for message in messages)
+    latest_valid = min(
+        min(message.envelope.valid_until_us,
+            message.envelope.capture_time_us + S3_TTL_US)
+        for message in messages)
+    cap = int(capture_us) + MAX_PREDICTION_US - 1
+    return int(min(max(ready, int(capture_us)), latest_valid, cap))
+
+
+def _first_accurate_report(scene_name: str):
+    """Earliest unambiguous target SAM row from Agent A's diagnostic. None if absent."""
+    path = Path("data/s4b-agent-a/target-diagnostics.json")
+    if not path.is_file():
+        return None
+    rows = json.loads(path.read_text(encoding="utf-8")).get("sam") or []
+    good = [row for row in rows
+            if row.get("scene") == scene_name and not row.get("ambiguous")
+            and (row.get("best_iou") or 0) >= 0.25 and row.get("available_s") is not None]
+    if not good:
+        return None
+    return min(good, key=lambda row: row["available_s"])
+
+
+def _ego_nearest_from_trace(scene_name: str, t_us: int, target_xy):
+    """Nearest local pedestrian in Agent A's trace at or after t_us. None if the trace has none."""
+    path = _tracked_trace(scene_name)
+    if not path.is_file():
+        path = _untracked_trace(scene_name)
+    if not path.is_file():
+        return None
+    future, past = [], []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("record") != "tick" or row.get("t_us") is None:
+            continue
+        (future if row["t_us"] >= t_us else past).append(row)
+    if future:
+        chosen = min(future, key=lambda row: row["t_us"])
+    elif past:
+        chosen = max(past, key=lambda row: row["t_us"])
+    else:
+        return None
+    best = None
+    for item in chosen.get("beliefs") or []:
+        if not item.get("local"):
+            continue
+        if str(item.get("cls", "")).upper() not in ("PEDESTRIAN", "PERSON"):
+            continue
+        dist = math.dist(item["xy"][:2], target_xy)
+        best = dist if best is None else min(best, dist)
+    return None if best is None else round(best, 3)
+
+
 def ego_clip_series(scene_name: str, target_xy):
-    """Per-tick ego beliefs already written by the eval runner. Empty if absent."""
-    path = Path("data/results/sam") / scene_name / "ego.jsonl"
+    """Per-tick ego beliefs from the untracked trace. Empty if absent."""
+    path = _untracked_trace(scene_name)
     if not path.is_file():
         return []
     series = []
@@ -1272,20 +1346,28 @@ def _demo_clip(spec, index, *, offline, budget_usd, key_seed, client):
                 errors.append(f"coverage: {exc}")
     ego_obs = [m for m in admitted if m.envelope.source_id == "ego"]
     remote = [m for m in admitted if m.envelope.source_id != "ego"]
+    # After the locals exist, and still inside the four-second prediction cap.
+    decision = demo_decision_us(capture, ego_obs)
     ghost_note = _inject_ghost(
-        coverage_map, store, anchors, key_seed, target, capture, events, ego_obs, remote)
+        coverage_map, store, anchors, key_seed, target, capture, events, ego_obs, remote,
+        fuse_us=decision)
     for message in admitted:
+        if message.envelope.generation_time_us > decision:
+            continue
         try:
-            coverage_map.add_observation(message, max(shown, capture + 200_000))
+            coverage_map.add_observation(message, decision)
         except ValueError:
             pass
     assessor = Assessor(store, coverage_map)
     try:
-        tick = max(shown, capture + 200_000)
+        tick = decision
+        # Untracked positions. Tracked replay adds false hazards, so it is not the map.
         ego_beliefs = fuse("ego", ego_observations=ego_obs, remote_admitted=remote,
-                           store=store, coverage_map=coverage_map, assessor=assessor, now_us=tick)
+                           store=store, coverage_map=coverage_map, assessor=assessor,
+                           now_us=tick, tracking=False)
         witness_beliefs = fuse("witness", ego_observations=ego_obs, remote_admitted=remote,
-                               store=store, coverage_map=coverage_map, assessor=assessor, now_us=tick)
+                               store=store, coverage_map=coverage_map, assessor=assessor,
+                               now_us=tick, tracking=False)
     except Exception as exc:
         ego_beliefs, witness_beliefs = [], []
         errors.append(f"fuse: {type(exc).__name__}: {exc}")
@@ -1295,25 +1377,39 @@ def _demo_clip(spec, index, *, offline, budget_usd, key_seed, client):
     clip_mode = "causal" if len(series) > 1 else "single"
     if spec["name"] == "blos_pedestrian_001":
         near_note = (
+            " The network did not verifiably locate the target."
             " At frame 000029 the nearest ego detection is 1.756 m away "
             "(cam2 box [160, 669, 188, 688], lift [26.42, -153.12, -0.28]). "
             "Target 81 projects mostly off the left edge of cam2; that box is a foot "
             "beside the cabinet, not the pedestrian. The car does not see target 81."
         )
     else:
-        near_note = (
-            f" Nearest ego pedestrian on the reviewed frame: "
-            f"{nearest if nearest is not None else 'none'} m."
-        )
+        report = _first_accurate_report(spec["name"])
+        if report is None:
+            near_note = " No Agent A trace of a roadside report was available."
+        else:
+            arrival = int(round(float(report["available_s"]) * 1_000_000))
+            traced = _ego_nearest_from_trace(spec["name"], arrival, target["xy"])
+            near_note = (
+                f" Ego-only finds nothing on the target. Nearest ego pedestrian "
+                f"when the roadside report arrives: {traced if traced is not None else 'none'} m. "
+                f"Roadside {report['source']} frame {report['frame']} arrives at "
+                f"{float(report['available_s']):.3f} s, single-source and unverified. "
+                "after the labelled clip; no lead time claimed."
+            )
     observers_xy = [
         {"id": "ego", "xy": [round(float(ego.lidar_to_site[0, 3]), 2),
                              round(float(ego.lidar_to_site[1, 3]), 2)]},
         {"id": rsu_id, "xy": [round(float(rsu.lidar_to_site[0, 3]), 2),
                               round(float(rsu.lidar_to_site[1, 3]), 2)]},
     ]
-    tick = max(shown, capture + 200_000)
+    tick = decision
     ground_truth = {"xy": [round(target["xy"][0], 2), round(target["xy"][1], 2)],
                     "label": "ground truth, not available to the robot"}
+    attack_checks, prepared_attacks, later_notes, before_free = _fuse_demo_attacks(
+        spec, target, ego_obs, remote, store, coverage_map, assessor, anchors, keys,
+        key_seed, decision)
+    events.extend(attack_checks)
     events.append(_story(coverage_map, tick + 1, observers_xy, {
         "beat": "hidden", "mode": clip_mode, "clip": spec["name"], "muse": False,
         "title": f"{spec['name']}: hidden pedestrian",
@@ -1351,11 +1447,10 @@ def _demo_clip(spec, index, *, offline, budget_usd, key_seed, client):
         "beliefs": [_public_belief(b) for b in witness_beliefs],
         "ground_truth": ground_truth,
     }))
-    attack_events, later_notes = _demo_attacks(
-        spec, target, ego_obs, remote, store, coverage_map, assessor, anchors, keys,
-        key_seed, tick, rsu_id, capture)
     attack_notes.update(later_notes)
-    events.extend(attack_events)
+    events.extend(_emit_attack_stories(
+        coverage_map, prepared_attacks, before_free, decision, target, rsu_id, capture,
+        spec["name"]))
     qa = _demo_question(
         spec, scene, ego, rsu, rsu_id, rsu_cam, target, client, keys, anchors,
         checker, store, coverage_map, tick, observers)
@@ -1369,6 +1464,7 @@ def _demo_clip(spec, index, *, offline, budget_usd, key_seed, client):
         "question": qa.get("summary"),
         "attacks": attack_notes,
         "single_source": qa.get("single_source"),
+        "decision_age_us": decision - capture,
     }
 
 
@@ -1600,7 +1696,8 @@ def query_time(queries, query_id):
     return None
 
 
-def _inject_ghost(coverage_map, store, anchors, key_seed, target, capture, events, ego_obs, remote):
+def _inject_ghost(coverage_map, store, anchors, key_seed, target, capture, events, ego_obs, remote,
+                  fuse_us=None):
     """A ghost 100 ms after the LiDAR scan, so the range proof can apply."""
     from coopx.attacks import attack_anchors, plan_attack
     from coopx.assess import Assessor
@@ -1640,11 +1737,19 @@ def _inject_ghost(coverage_map, store, anchors, key_seed, target, capture, event
     try:
         beliefs = fuse("witness", ego_observations=list(ego_obs), remote_admitted=list(remote) + accepted,
                        store=store, coverage_map=coverage_map, assessor=Assessor(store, coverage_map),
-                       now_us=when)
+                       now_us=fuse_us if fuse_us is not None else when, tracking=False)
+        tracked = fuse("witness", ego_observations=list(ego_obs), remote_admitted=list(remote) + accepted,
+                       store=store, coverage_map=coverage_map, assessor=Assessor(store, coverage_map),
+                       now_us=fuse_us if fuse_us is not None else when, tracking=True)
     except Exception:
-        beliefs = []
+        beliefs, tracked = [], []
+    def _kept(rows):
+        return any(b.local and b.state != "contradicted" for b in rows)
     return {"witnesses": witness_count(store, accepted),
-            "local_kept": any(b.local and b.state != "contradicted" for b in beliefs),
+            "local_kept": _kept(beliefs),
+            "local_count": sum(1 for b in beliefs if b.local),
+            "tracked_local_kept": _kept(tracked),
+            "tracked_local_count": sum(1 for b in tracked if b.local),
             "packets": len(plan.packets), "contradicted": contradicted,
             "beliefs": [_public_belief(b) for b in beliefs]}
 
@@ -1660,8 +1765,8 @@ def _range_rejects(store, coverage_map, message, when):
     return False
 
 
-def _demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, anchors,
-                  keys, key_seed, base, rsu_id, capture):
+def _fuse_demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, anchors,
+                       keys, key_seed, base):
     from coopx.attacks import attack_anchors, plan_attack
     from coopx.envelope import evidence_ref
     from coopx.eval.fusion import fuse
@@ -1670,8 +1775,8 @@ def _demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, 
     prepared = []
     scene = {"target_xyz": (target["xy"][0], target["xy"][1], target["z"]),
              "ego_xyz": ego_obs[0].observation.xyz_m if ego_obs else (target["xy"][0], target["xy"][1], 0.5)}
-    # While the fast-path observations are still inside their 5 s validity.
-    when = base + 1_000_000
+    # `base` is already inside the prediction cap. Adding a second pushes locals out.
+    when = base
     free = _free_cell(coverage_map, when)
     if free is not None:
         scene["free_xyz"] = (free[0], free[1], 0.5)
@@ -1701,14 +1806,23 @@ def _demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, 
         local = list(ego_obs)
         try:
             beliefs = fuse("witness", ego_observations=local, remote_admitted=remote + obs,
-                           store=store, coverage_map=coverage_map, assessor=assessor, now_us=when)
+                           store=store, coverage_map=coverage_map, assessor=assessor,
+                           now_us=when, tracking=False)
+            tracked = fuse("witness", ego_observations=local, remote_admitted=remote + obs,
+                           store=store, coverage_map=coverage_map, assessor=assessor,
+                           now_us=when, tracking=True)
         except Exception:
-            beliefs = []
+            beliefs, tracked = [], []
         witnesses = 0
         if obs:
             witnesses = max(store.independent_witnesses(m, obs) for m in obs)
         kept = any(b.local and b.state != "contradicted" for b in beliefs)
-        notes[kind] = {"witnesses": witnesses, "local_kept": kept, "packets": len(plan.packets)}
+        tracked_kept = any(b.local and b.state != "contradicted" for b in tracked)
+        notes[kind] = {"witnesses": witnesses, "local_kept": kept,
+                       "local_count": sum(1 for b in beliefs if b.local),
+                       "tracked_local_kept": tracked_kept,
+                       "tracked_local_count": sum(1 for b in tracked if b.local),
+                       "packets": len(plan.packets)}
         title = {"ghost_free": "Ghost, Muse off", "sybil": "Sybil", "remote_clear": "Remote clear"}[kind]
         body = {
             "ghost_free": "Deterministic range check. Muse is off, so the rejection does not wait on a model.",
@@ -1718,19 +1832,26 @@ def _demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, 
         }[kind]
         prepared.append((kind, title, body, beliefs, witnesses))
     before_free = len(coverage_map.snapshot(max(when, coverage_map._now_us)).get("free") or [])
+    return events, prepared, notes, before_free
+
+
+def _emit_attack_stories(coverage_map, prepared, before_free, decision, target, rsu_id, capture,
+                         clip_name):
+    events = []
     for index, (kind, title, body, beliefs, witnesses) in enumerate(prepared):
-        events.append(_story(coverage_map, when + 1 + index, [], {
-            "beat": kind, "mode": "single", "clip": spec["name"], "muse": False,
+        events.append(_story(coverage_map, decision + 5 + index, [], {
+            "beat": kind, "mode": "single", "clip": clip_name, "muse": False,
             "title": title, "body": body,
             "beliefs": [_public_belief(b) for b in beliefs],
             "witnesses": witnesses,
             "ground_truth": {"xy": [round(target["xy"][0], 2), round(target["xy"][1], 2)],
                              "label": "ground truth, not available to the robot"},
         }))
+    # The prepared tuple does not carry the clip name. Stamp it from the caller via decision stories.
     expire = max(coverage_map._now_us, capture + S3_TTL_US) + 1
     events.append(make_event(t_replay_us=expire - 1, type="observer_disconnected", source_id=rsu_id))
     after = _story(coverage_map, expire, [], {
-        "beat": "disconnect", "mode": "single", "clip": spec["name"], "muse": False,
+        "beat": "disconnect", "mode": "single", "clip": clip_name, "muse": False,
         "title": "Observer disconnect",
         "body": "",
         "beliefs": [],
@@ -1738,7 +1859,7 @@ def _demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, 
     after["detail"]["story"]["body"] = coverage_change_caption(
         before_free, after["detail"]["story"]["free_cells"], rsu_id)
     events.append(after)
-    return events, notes
+    return events
 
 
 def _free_cell(coverage_map, now_us):

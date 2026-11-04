@@ -730,7 +730,8 @@ function renderReasoner() {
     host.appendChild(row);
   }
   host.appendChild(el("h3", "", "Verdict"));
-  const verdicts = museOn ? evs.filter((e) => e.type === "verdict") : [];
+  const verdicts = evs.filter((e) => e.type === "verdict" && (
+    museOn || String((e.detail && e.detail.reason) || "").startsWith("Downgraded")));
   if (!verdicts.length) host.appendChild(el("p", "muted", "No verdict yet."));
   for (const event of verdicts) {
     host.appendChild(el("p", "", `${event.state} · ${event.detail.reason || ""}`));
