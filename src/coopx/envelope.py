@@ -116,6 +116,7 @@ class ObservationMessage:
     kind: Kind = Kind.PERCEIVED
     geometry: Geometry = Geometry.POINT_STD
     label_id: int | None = None
+    velocity_std_mps: tuple[float, float, float] | None = None
     _wire: bytes | None = field(default=None, init=False, compare=False, repr=False)
 
     def __post_init__(self):
@@ -130,6 +131,11 @@ class ObservationMessage:
             raise ValueError("oriented box requires dimensions and yaw")
         if self.label_id is not None:
             uint(self.label_id, 32, "label_id")
+        if self.velocity_std_mps is not None:
+            v = self.velocity_std_mps
+            if (o.velocity_mps is None or not isinstance(v, tuple) or len(v) != 3
+                    or any(not math.isfinite(x) or x < 0 for x in v)):
+                raise ValueError("velocity uncertainty requires velocity and three finite nonnegative values")
         if l.derivation == "direct" and (l.origin_observer != e.source_id or l.origin_observation_id != e.message_id or l.origin_capture_time_us != e.capture_time_us or l.root_ref):
             raise ValueError("direct origin must be this observation")
 
@@ -169,7 +175,7 @@ def signing_bytes(message: ObservationMessage | CoverageMessage) -> bytes:
             raise ValueError("unsupported signed message body")
         return coverage_signing_bytes(message)
     e, l = message.envelope, message.lineage
-    flags = (e.sensor_seq is not None) | ((message.label_id is not None) << 1) | (bool(l.root_ref) << 2)
+    flags = (e.sensor_seq is not None) | ((message.label_id is not None) << 1) | (bool(l.root_ref) << 2) | ((message.velocity_std_mps is not None) << 3)
     out = MAGIC + struct.pack("<BBB", e.protocol_version, MESSAGE_TYPES.index(e.message_type), flags)
     for value in (e.message_id, e.source_id, e.session_id, e.spatial_frame_id, e.auth.key_ref):
         out += _pack_text(value)
@@ -186,6 +192,9 @@ def signing_bytes(message: ObservationMessage | CoverageMessage) -> bytes:
         out += bytes.fromhex(l.root_ref)
     out += b"".join(bytes.fromhex(ref) for ref in l.parents)
     out += base64.b64decode(radio_codec.encode(message.observation)[len(radio_codec.PREFIX):])
+    # Optional signed CX2 extension; legacy CX1 body and absent-extension bytes stay unchanged.
+    if message.velocity_std_mps is not None:
+        out += struct.pack("<3d", *message.velocity_std_mps)
     if len(out) + 64 > MAX_PACKET_BYTES:
         raise ValueError("CX2 packet too large")
     return out
@@ -211,7 +220,7 @@ def decode(raw: bytes) -> ObservationMessage | CoverageMessage:
     if r.take(4) != MAGIC:
         raise ValueError("unsupported CX2 magic")
     version, msgtype, flags = r.unpack("<BBB")
-    if msgtype >= len(MESSAGE_TYPES) or flags & ~7:
+    if msgtype >= len(MESSAGE_TYPES) or flags & ~15:
         raise ValueError("unsupported CX2 type/flags")
     mid, source, session, frame, key_ref = (r.text() for _ in range(5))
     capture, generation, expiry = r.unpack("<QQQ")
@@ -227,13 +236,14 @@ def decode(raw: bytes) -> ObservationMessage | CoverageMessage:
     root = r.take(32).hex() if flags & 4 else ""
     parents = tuple(r.take(32).hex() for _ in range(count))
     body = r.take(radio_codec.RECORD.size)
+    velocity_std = r.unpack("<3d") if flags & 8 else None
     signature = r.take(64)
     if r.offset != len(raw):
         raise ValueError("trailing CX2 bytes")
     observation = radio_codec.decode(radio_codec.PREFIX + base64.b64encode(body).decode("ascii"), source=source)
     message = ObservationMessage(
         Envelope(version, MESSAGE_TYPES[msgtype], mid, source, session, frame, capture, generation, expiry, Auth(key_ref, signature), seq),
-        observation, Lineage(origin, sensor, oid, origin_capture, DERIVATIONS[derivation], parents, root), Kind(kind), Geometry(geometry), label)
+        observation, Lineage(origin, sensor, oid, origin_capture, DERIVATIONS[derivation], parents, root), Kind(kind), Geometry(geometry), label, velocity_std)
     # CX1 ignores absent slots; canonical checking ensures verification covers
     # exactly the bytes received, even for fields ignored by the CX1 decoder.
     if encode(message) != raw:
