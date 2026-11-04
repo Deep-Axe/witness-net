@@ -26,7 +26,14 @@ def load_runs(results_dir: Path) -> list[dict]:
     return runs
 
 
-def render_summary(runs: list[dict]) -> str:
+def render_summary(runs: list[dict], *, scene_review: dict | None = None) -> str:
+    report_scenes = {run.get("scene") for run in runs if run.get("split") == "report"}
+    approved = set((scene_review or {}).get("approved_scenes", ()))
+    if report_scenes and report_scenes <= approved:
+        review_note = (f"The user approved these report clips after camera-view review on "
+                       f"{scene_review['date']}. This approves visual clip selection, not warning timing.")
+    else:
+        review_note = "Visual approval has not been supplied for every report clip in this summary."
     lines = [
         "# Witness evaluation (S4a, deterministic fusion; Muse off)",
         "",
@@ -46,9 +53,11 @@ def render_summary(runs: list[dict]) -> str:
         "warning to the ego's first labelled-visible frame; `n/a` = no warning or the ego",
         "never sees the target in the window (censored, not success).",
         "",
-        "**Split.** `report` = mined clips (`data/scenes/scenes.json`, provisional labels,",
-        "human review pending). `tune` = the S3 frame (pedestrian outside the ego's view,",
-        "not occluded). No parameters were tuned on report clips.",
+        "**Split.** `report` = mined clips (`data/scenes/scenes.json`). " + review_note,
+        "`tune` = S3 frame 000096: pedestrian 53 partly enters ego cam2 and is labelled",
+        "`insufficient_evidence`; it is not an occluded report clip. No parameters were tuned on report clips.",
+        "The UPS/pedestrian-110 example is an illustrative still (0.2 s roadside support),",
+        "excluded from clip timing claims. Missing later ego visibility remains censored.",
         "",
         "**Modes.** `ego` own sensors only; `union` every admitted remote claim (absence claims",
         "never delete a local detection); `geo` object-level geometric consensus inspired by",
@@ -103,8 +112,29 @@ def _table(runs) -> list[str]:
     return lines
 
 
-def write_summary(results_dir: Path, out: Path) -> str:
-    text = render_summary(load_runs(results_dir))
+def _scene_review(scene_manifest: Path) -> dict | None:
+    """Match visual approvals to exact scene identities, not reusable clip names."""
+    review_path = scene_manifest.parent / "human-review.json"
+    if not scene_manifest.is_file() or not review_path.is_file():
+        return None
+    manifest = json.loads(scene_manifest.read_text(encoding="utf-8"))
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    approved = []
+    for item in review.get("clips", []):
+        if not item.get("approved_for_report"):
+            continue
+        for scene in manifest.get("scenes", []):
+            if (scene["name"] == item["scene"] and scene["scenario"] == item["scenario"]
+                    and scene["ego_id"] == item["ego_id"]
+                    and any(t["gt_id"] == item["gt_id"] for t in scene["targets"])
+                    and scene["hidden_interval"].get(item["gt_id"], [None])[0] == item["frame_id"]
+                    and any(o[1:] == [item["rsu_agent"], item["rsu_camera"]] for o in scene["observers"])):
+                approved.append(scene["name"])
+    return {"date": review["reviewed_on"], "approved_scenes": approved}
+
+
+def write_summary(results_dir: Path, out: Path, *, scene_manifest: Path = Path("data/scenes/scenes.json")) -> str:
+    text = render_summary(load_runs(results_dir), scene_review=_scene_review(Path(scene_manifest)))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

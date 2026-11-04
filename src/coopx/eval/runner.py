@@ -48,7 +48,7 @@ TAIL_US = 3_000_000
 FIXTURE = dict(
     name="frame-000096", scenario="2023-04-04-14-28-53_45_0", frames=("000096",),
     ego_id="2", observers=(("rsu-2-cam2", "-2", "cam2"), ("rsu-1-cam1", "-1", "cam1")),
-    target="53", visibility="outside_view")
+    target="53", visibility="insufficient_evidence")
 
 
 # ---------------------------------------------------------------------------

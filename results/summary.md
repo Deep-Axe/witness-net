@@ -16,9 +16,11 @@ visibility label is `occluded` (FOV alone is not occlusion). Lead time is first
 warning to the ego's first labelled-visible frame; `n/a` = no warning or the ego
 never sees the target in the window (censored, not success).
 
-**Split.** `report` = mined clips (`data/scenes/scenes.json`, provisional labels,
-human review pending). `tune` = the S3 frame (pedestrian outside the ego's view,
-not occluded). No parameters were tuned on report clips.
+**Split.** `report` = mined clips (`data/scenes/scenes.json`). The user approved these report clips after camera-view review on 2026-11-04. This approves visual clip selection, not warning timing.
+`tune` = S3 frame 000096: pedestrian 53 partly enters ego cam2 and is labelled
+`insufficient_evidence`; it is not an occluded report clip. No parameters were tuned on report clips.
+The UPS/pedestrian-110 example is an illustrative still (0.2 s roadside support),
+excluded from clip timing claims. Missing later ego visibility remains censored.
 
 **Modes.** `ego` own sensors only; `union` every admitted remote claim (absence claims
 never delete a local detection); `geo` object-level geometric consensus inspired by
