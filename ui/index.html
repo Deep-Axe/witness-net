@@ -37,10 +37,11 @@
     <span id="clock">t = 0 µs</span>
   </section>
   <section class="controls">
+    <label>Clip <select id="clip"></select></label>
     <div id="beats" class="beats"></div>
     <label>Question <input id="question" type="text" placeholder="Ask about the hidden pedestrian"></label>
     <button id="ask" type="button">Ask</button>
-    <label>Attack
+    <label>Replay attack
       <select id="attack">
         <option value="">none</option>
         <option value="ghost_free">ghost, Muse off</option>
@@ -48,8 +49,8 @@
         <option value="remote_clear">remote clear</option>
       </select>
     </label>
-    <button id="disconnect" type="button">Disconnect observer</button>
-    <label class="toggle"><input id="muse" type="checkbox" checked> Muse on</label>
+    <button id="disconnect" type="button">Replay disconnect</button>
+    <label class="toggle"><input id="muse" type="checkbox"> Show Muse events</label>
   </section>
 
   <main class="grid">
@@ -88,7 +89,7 @@
       </section>
       <section class="panel map-panel" data-slot="bev">
         <h2>Coverage map</h2>
-        <canvas id="map" width="480" height="480" aria-label="BEV coverage grid"></canvas>
+        <canvas id="map" width="480" height="480" tabindex="0" aria-label="BEV coverage grid"></canvas>
         <ul class="legend">
           <li><span class="swatch occupied"></span>occupied</li>
           <li><span class="swatch free"></span>free</li>

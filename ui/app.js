@@ -298,6 +298,8 @@ function latestAssessments(t) {
 }
 
 function gridSpec() {
+  const snap = latestOf("map_snapshot", state.t);
+  if (snap && snap.detail && snap.detail.grid && snap.detail.grid.nx) return snap.detail.grid;
   const cov = latestOf("coverage_published", state.t);
   if (cov && cov.detail && cov.detail.grid) return cov.detail.grid;
   return DEFAULT_GRID;
@@ -395,12 +397,15 @@ function cellKey(cell) {
 }
 
 function eventByRef(ref, t) {
-  // Publication row for a claim's evidence ref (coverage or observation).
+  // Publication row for a claim's evidence ref. Demo logs keep the ref on the
+  // accepted check when they do not also emit a coverage_published row.
+  let check = null;
   for (const event of until(t)) {
-    if ((event.type === "coverage_published" || event.type === "observation_published")
-        && event.evidence_ref === ref) return event;
+    if (event.evidence_ref !== ref) continue;
+    if (event.type === "coverage_published" || event.type === "observation_published") return event;
+    if (event.type === "check" && check === null) check = event;
   }
-  return null;
+  return check;
 }
 
 function claimsForCell(ix, iy) {
@@ -594,8 +599,13 @@ function currentStory() {
   return found.length ? found[found.length - 1].detail.story : null;
 }
 
+function storyClip(event) {
+  return event.detail && event.detail.story && event.detail.story.clip;
+}
+
 function jumpToBeat(beat) {
-  const event = state.events.find((e) => e.detail && e.detail.story && e.detail.story.beat === beat);
+  const event = state.events.find((e) => e.detail && e.detail.story && e.detail.story.beat === beat
+    && (!state.clip || storyClip(e) === state.clip));
   if (!event) return;
   state.t = event.t_replay_us;
   $("scrub").value = String(state.t);
@@ -606,10 +616,32 @@ function renderBadge() {
   const badge = $("mode-badge");
   if (!badge) return;
   const story = currentStory();
-  const snapshot = story ? story.mode === "snapshot" : until(state.t).some(
-    (e) => e.type === "check" && e.detail && e.detail.mode === "snapshot");
-  badge.textContent = snapshot ? "Paused snapshot Q&A" : "Causal replay";
-  badge.className = snapshot ? "badge snapshot" : "badge";
+  const text = story && story.badge
+    ? story.badge
+    : (story && story.mode === "snapshot" ? "Paused snapshot Q&A"
+      : story && story.mode === "causal" ? "Causal replay" : "Single frame");
+  badge.textContent = text;
+  badge.className = text === "Paused snapshot Q&A" ? "badge snapshot" : "badge";
+}
+
+function renderClips() {
+  const select = $("clip");
+  if (!select) return;
+  const names = [];
+  for (const event of state.events) {
+    const clip = storyClip(event);
+    if (clip && !names.includes(clip)) names.push(clip);
+  }
+  const previous = state.clip;
+  clear(select);
+  for (const name of names) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    select.appendChild(option);
+  }
+  state.clip = names.includes(previous) ? previous : (names[0] || "");
+  select.value = state.clip;
 }
 
 function renderBeats() {
@@ -617,6 +649,7 @@ function renderBeats() {
   if (!host) return;
   const names = [];
   for (const event of state.events) {
+    if (state.clip && storyClip(event) !== state.clip) continue;
     const beat = event.detail && event.detail.story && event.detail.story.beat;
     if (beat && !names.includes(beat)) names.push(beat);
   }
@@ -637,8 +670,21 @@ function renderReasoner() {
   if (story) {
     host.appendChild(el("h3", "", story.title || story.beat));
     host.appendChild(el("p", "", story.body || ""));
+    if (story.ground_truth && story.ground_truth.label) {
+      host.appendChild(el("p", "muted", story.ground_truth.label));
+    }
+    if (story.region) {
+      host.appendChild(el("p", "", `Operator-selected region ${JSON.stringify(story.region)}`));
+    }
+    if (Array.isArray(story.ticks) && story.ticks.length) {
+      const seen = story.ticks.filter((row) => row.seen).map((row) => row.frame);
+      host.appendChild(el("p", "", `Frames within 1.5 m: ${seen.length ? seen.join(", ") : "none"}.`));
+    }
     if (story.witnesses != null) {
       host.appendChild(el("p", "", `Independent witnesses: ${story.witnesses}`));
+    }
+    if (story.free_cells != null) {
+      host.appendChild(el("p", "", `Free cells on the map: ${story.free_cells}`));
     }
     for (const belief of story.beliefs || []) {
       const bits = [`${belief.local ? "local" : "remote"} ${belief.cls} ${belief.state}`];
@@ -648,8 +694,8 @@ function renderReasoner() {
       host.appendChild(el("p", "belief", bits.join(" · ")));
     }
   }
-  const museOn = !$("muse") || $("muse").checked;
-  if (!museOn) host.appendChild(el("p", "muted", "Muse off. Hazards use the deterministic path only."));
+  const museOn = $("muse") && $("muse").checked;
+  if (!museOn) host.appendChild(el("p", "muted", "Muse events hidden. The fast path above does not wait on them."));
   const evs = until(state.t);
   const asked = evs.find((e) => (e.type === "query" || e.type === "model_call")
     && typeof e.detail.question === "string");
@@ -765,13 +811,18 @@ function setLog(text, label) {
     filters.appendChild(button);
   }
   showEvidence("Click a cell or assessed object.", []);
+  renderClips();
   renderBeats();
+  const cameras = new URLSearchParams(location.search).get("cameras") === "1";
   const img = $("s3-overlay");
   if (img) {
     img.hidden = true;
-    img.onload = () => { img.hidden = false; };
-    img.onerror = () => { img.hidden = true; };
-    img.src = "/data/s3/overlay.png";
+    if (cameras && state.clip) {
+      img.onload = () => { img.hidden = false; };
+      img.onerror = () => { img.hidden = true; };
+      const frame = state.clip.endsWith("002") ? "000000" : "000029";
+      img.src = `/data/scenes/overlays/${state.clip}-${frame}.png`;
+    }
   }
   render();
 }
@@ -833,6 +884,11 @@ if ($("attack")) {
 }
 if ($("disconnect")) $("disconnect").addEventListener("click", () => jumpToBeat("disconnect"));
 if ($("muse")) $("muse").addEventListener("change", render);
+if ($("clip")) $("clip").addEventListener("change", () => {
+  state.clip = $("clip").value;
+  renderBeats();
+  jumpToBeat("hidden");
+});
 
 const params = new URLSearchParams(location.search);
 const log = params.get("log");
