@@ -91,6 +91,8 @@ def render_summary(
                     f"- {run.get('scene')} {run.get('perception')} {run.get('fusion')} "
                     f"{run.get('attack') or '—'}: {run['error']}"
                 )
+    if study and study.get("clip2_extension"):
+        lines.extend(_clip2_extension_section(study["clip2_extension"]))
     lines.append("")
     return "\n".join(lines)
 
@@ -460,4 +462,146 @@ def _tracking_tables(study):
             ]
         )
     lines += ["", "## Strict attack matrix (τ = 0)", ""]
+    return lines
+
+
+def _clip2_extension_section(extension):
+    """Append-only inspection: no scored rows or metrics are replaced."""
+    e = extension
+    boundary = e["mining_boundary"]
+    crossing = next(
+        (
+            r
+            for r in boundary
+            if r["ego_range_m"] is not None and r["ego_range_m"] > e["mining_range_m"]
+        ),
+        None,
+    )
+    last = next((r for r in boundary if r["frame"] == e["mining_last_record"]), None)
+    first = e["first_report"]
+
+    def seconds(value):
+        return "n/a" if value is None else f"{value / 1e6:.3f}"
+
+    def nearest(value):
+        if value is None:
+            return "n/a"
+        identity = value.get("identity") or "unknown"
+        if value.get("ambiguous"):
+            identity += " (ambiguous)"
+        return f"{_fmt(value['distance_m'])} m; {value['source']}; {value['state']}; ID {identity}; capture {seconds(value['capture_us'])} s"
+
+    lines = [
+        "",
+        "## Clip 2 occlusion after the mined window (unscored)",
+        "",
+        e["disclaimer"],
+        "",
+        "SAM without tracking is the control and the first row below. Tracking is **experimental, not a headline**;",
+        "no tracking result is substituted for this existing trace. Visibility is recomputed with `visibility()`",
+        "and native LiDAR/calibration, sharing the target GT when absent from an agent’s own annotations.",
+        "These are algorithmic visibility labels; frame 000030 overlays still require human review.",
+        "",
+        (
+            f"The original mining record stops at {e['mining_last_record']}. Its {e['mining_range_m']:.0f} m ego-distance gate "
+            f"is satisfied at that frame ({last['ego_range_m']:.3f} m) and crossed at {crossing['frame']} "
+            f"({crossing['ego_range_m']:.3f} m). The miner adds {e['context_frames_after_record']} context frames, "
+            f"ending the selected window at {e['mined_window_end']}. This cutoff was not the end of GT or a visible-ego transition."
+        ),
+        "",
+        (
+            f"Target 138 GT is last present at {e['gt_last_present']}; the first missing frame is {e['gt_first_missing']}. "
+            f"Later GT returns: {', '.join(e['gt_returns_after_first_missing']) or 'none'}. No target position is extrapolated past missing GT."
+        ),
+        "",
+        "| mode | first audited tick / time (s) | target distance (m) | source | state | capture time (s) | nearest ego detection at that tick |",
+        "|---|---|---:|---|---|---:|---|",
+    ]
+    if first:
+        lines.append(
+            f"| SAM without tracking | {first['frame']} / {seconds(first['t_us'])} | {_fmt(first['distance_m'])} | "
+            f"{first['source']} | {first['state']} | {seconds(first['capture_us'])} | {nearest(first['ego_nearest'])} |"
+        )
+    else:
+        lines.append("| SAM without tracking | none | n/a | n/a | n/a | n/a | n/a |")
+    lines.extend(
+        [
+            "",
+            "Distances below are from the original, already-admitted witness belief stream to the target’s current GT.",
+            "The nearest ego detection is a local pedestrian report, with its capture-time identity audit shown;",
+            "a nearby different person is not evidence that the ego sees target 138. The identity audit is geometric,",
+            "not appearance-based identity certification. No new inference or benchmark rescoring has been performed.",
+            "",
+            "| frame | time (s) | GT source agents | ego visibility | RSU -1 visibility | ego-to-target range (m) | audited target report distance (m) | nearest ego detection |",
+            "|---|---:|---|---|---|---:|---:|---|",
+        ]
+    )
+    for row in e["rows"]:
+        ego = row["ego_visibility"]["label"] if row["ego_visibility"] else "GT missing"
+        rsu = row["rsu_visibility"]["label"] if row["rsu_visibility"] else "GT missing"
+        report = row["target_report"]
+        lines.append(
+            f"| {row['frame']} | {seconds(row['t_us'])} | {', '.join(row['gt_sources']) or 'none'} | {ego} | {rsu} | "
+            f"{_fmt(row['ego_range_m'])} | {_fmt(report['distance_m'] if report else None)} | {nearest(row['ego_nearest'])} |"
+        )
+    if first:
+        lines.extend(
+            [
+                "",
+                (
+                    f"At its first audited tick, this report is {(first['t_us'] - first['capture_us']) / 1e6:.3f} s old. "
+                    "It is not a new SAM inference on frame 000030."
+                ),
+            ]
+        )
+    blockers = e.get("frame_000030_gt_blockers", [])
+    if blockers:
+        labels = ", ".join(
+            f"{b['label']} {b['gt_id']} ({b['blocked_sample_fraction']:.0%} of sampled sight lines)"
+            for b in blockers
+        )
+        lines.extend(
+            [
+                "",
+                (
+                    f"At frame 000030, native ego GT identifies these occluders: {labels}. "
+                    "The bus in this later view should not be described as the same dark-car blocker reviewed at frame 000000."
+                ),
+            ]
+        )
+    insufficient = [
+        row["frame"]
+        for row in e["rows"]
+        if row["rsu_visibility"]
+        and row["rsu_visibility"]["label"] == "insufficient_evidence"
+    ]
+    beyond = [
+        row["frame"]
+        for row in e["rows"]
+        if row["ego_range_m"] is not None and row["ego_range_m"] > 50.0
+    ]
+    lines.extend(
+        [
+            "",
+            "### Qualifications and human-review overlays",
+            "",
+            f"RSU visibility is insufficient at {', '.join(insufficient) or 'no inspected frames'}; continuous roadside visibility is not established across that gap.",
+            (
+                f"The target GT range exceeds the unchanged nominal 50 m hazard-scoring radius from {beyond[0] if beyond else 'no inspected frame'}. "
+                "The ego-to-target distance increases through this inspection; no collision-course or lead-time benefit is demonstrated."
+            ),
+            "This is one clip and one reporting source. Ego occlusion is not independent corroboration; later missing GT censors further conclusions.",
+            "The appended inspection contradicts treating the mined cutoff as GT disappearance. It does not change the original zero scored recall.",
+            "",
+            "Frame 000030 files (local, gitignored; full-resolution views and context crops with projected GT boxes):",
+            "",
+        ]
+    )
+    lines.extend(f"- `{path}`" for path in e["overlays"])
+    lines.extend(
+        [
+            "",
+            f"Existing trace SHA-256: `{e['trace_sha256']}`. The source trace and all existing scored rows remain unchanged.",
+        ]
+    )
     return lines

@@ -358,3 +358,82 @@ also cannot be attributed solely to motion during API latency. None of these che
 | tune | frame-000096 | — | geo | n/a | n/a | n/a | 0 | 0 | 0 | 0 | 0 | — | 0 | 0 |
 | tune | frame-000096 | — | union | n/a | n/a | n/a | 0 | 0 | 0 | 0 | 0 | — | 0 | 0 |
 | tune | frame-000096 | — | witness | n/a | n/a | n/a | 0 | 0 | 0 | 0 | 0 | — | 0 | 0 |
+
+## Clip 2 occlusion after the mined window (unscored)
+
+Window extended after results were seen; not part of the scored clip. Single clip, single source. No lead time is claimed.
+
+SAM without tracking is the control and the first row below. Tracking is **experimental, not a headline**;
+no tracking result is substituted for this existing trace. Visibility is recomputed with `visibility()`
+and native LiDAR/calibration, sharing the target GT when absent from an agent’s own annotations.
+These are algorithmic visibility labels; frame 000030 overlays still require human review.
+
+The original mining record stops at 000018. Its 40 m ego-distance gate is satisfied at that frame (39.740 m) and crossed at 000019 (40.565 m). The miner adds 3 context frames, ending the selected window at 000021. This cutoff was not the end of GT or a visible-ego transition.
+
+Target 138 GT is last present at 000033; the first missing frame is 000034. Later GT returns: none. No target position is extrapolated past missing GT.
+
+| mode | first audited tick / time (s) | target distance (m) | source | state | capture time (s) | nearest ego detection at that tick |
+|---|---|---:|---|---|---:|---|
+| SAM without tracking | 000030 / 3.000 | 0.146 | rsu-1-cam2 | unverified | 0.000 | 19.962 m; ego-cam4; confirmed; ID 144; capture 0.500 s |
+
+Distances below are from the original, already-admitted witness belief stream to the target’s current GT.
+The nearest ego detection is a local pedestrian report, with its capture-time identity audit shown;
+a nearby different person is not evidence that the ego sees target 138. The identity audit is geometric,
+not appearance-based identity certification. No new inference or benchmark rescoring has been performed.
+
+| frame | time (s) | GT source agents | ego visibility | RSU -1 visibility | ego-to-target range (m) | audited target report distance (m) | nearest ego detection |
+|---|---:|---|---|---|---:|---:|---|
+| 000000 | 0.000 | 2 | occluded | visible | 26.685 | n/a | n/a |
+| 000001 | 0.100 | 2 | occluded | visible | 27.305 | n/a | n/a |
+| 000002 | 0.200 | 2 | occluded | visible | 27.922 | n/a | n/a |
+| 000003 | 0.300 | 2 | occluded | visible | 28.587 | n/a | n/a |
+| 000004 | 0.400 | 2 | occluded | visible | 29.220 | n/a | n/a |
+| 000005 | 0.500 | 2 | occluded | visible | 29.908 | n/a | n/a |
+| 000006 | 0.600 | 2 | occluded | visible | 30.589 | n/a | n/a |
+| 000007 | 0.700 | 2 | occluded | visible | 31.323 | n/a | n/a |
+| 000008 | 0.800 | 2 | occluded | visible | 32.036 | n/a | n/a |
+| 000009 | 0.900 | 2 | occluded | visible | 32.750 | n/a | n/a |
+| 000010 | 1.000 | 2 | occluded | visible | 33.378 | n/a | n/a |
+| 000011 | 1.100 | 2 | occluded | visible | 34.214 | n/a | n/a |
+| 000012 | 1.200 | 2 | occluded | visible | 34.969 | n/a | n/a |
+| 000013 | 1.300 | 2 | occluded | visible | 35.750 | n/a | n/a |
+| 000014 | 1.400 | 2 | occluded | visible | 36.515 | n/a | n/a |
+| 000015 | 1.500 | 2 | occluded | visible | 37.297 | n/a | n/a |
+| 000016 | 1.600 | 2 | occluded | visible | 38.132 | n/a | n/a |
+| 000017 | 1.700 | 2 | occluded | visible | 38.913 | n/a | n/a |
+| 000018 | 1.800 | 2 | occluded | visible | 39.740 | n/a | n/a |
+| 000019 | 1.900 | 2 | occluded | visible | 40.565 | n/a | n/a |
+| 000020 | 2.000 | 2 | occluded | visible | 41.419 | n/a | n/a |
+| 000021 | 2.100 | 2 | occluded | visible | 42.177 | n/a | n/a |
+| 000022 | 2.200 | 2 | occluded | visible | 43.036 | n/a | n/a |
+| 000023 | 2.300 | 2 | occluded | insufficient_evidence | 43.852 | n/a | n/a |
+| 000024 | 2.400 | 2 | occluded | insufficient_evidence | 44.670 | n/a | n/a |
+| 000025 | 2.500 | 2 | occluded | insufficient_evidence | 45.497 | n/a | n/a |
+| 000026 | 2.600 | 2 | occluded | insufficient_evidence | 46.329 | n/a | n/a |
+| 000027 | 2.700 | 2 | occluded | visible | 47.194 | n/a | 39.767 m; ego-cam1; confirmed; ID 206; capture 0.000 s |
+| 000028 | 2.800 | 2 | occluded | visible | 48.016 | n/a | 32.259 m; ego-cam2; confirmed; ID 51; capture 0.000 s |
+| 000029 | 2.900 | 2 | occluded | visible | 48.808 | n/a | 19.953 m; ego-cam4; confirmed; ID 144; capture 0.500 s |
+| 000030 | 3.000 | 2 | occluded | visible | 49.629 | 0.146 | 19.962 m; ego-cam4; confirmed; ID 144; capture 0.500 s |
+| 000031 | 3.100 | 2 | occluded | visible | 50.438 | 0.178 | 19.994 m; ego-cam4; confirmed; ID 144; capture 0.500 s |
+| 000032 | 3.200 | 2 | occluded | visible | 51.376 | 0.140 | 19.949 m; ego-cam4; confirmed; ID 144; capture 0.500 s |
+| 000033 | 3.300 | 2 | occluded | visible | 52.307 | 0.164 | 19.881 m; ego-cam4; confirmed; ID 144; capture 0.500 s |
+
+At its first audited tick, this report is 3.000 s old. It is not a new SAM inference on frame 000030.
+
+At frame 000030, native ego GT identifies these occluders: Bus 9 (100% of sampled sight lines). The bus in this later view should not be described as the same dark-car blocker reviewed at frame 000000.
+
+### Qualifications and human-review overlays
+
+RSU visibility is insufficient at 000023, 000024, 000025, 000026; continuous roadside visibility is not established across that gap.
+The target GT range exceeds the unchanged nominal 50 m hazard-scoring radius from 000031. The ego-to-target distance increases through this inspection; no collision-course or lead-time benefit is demonstrated.
+This is one clip and one reporting source. Ego occlusion is not independent corroboration; later missing GT censors further conclusions.
+The appended inspection contradicts treating the mined cutoff as GT disappearance. It does not change the original zero scored recall.
+
+Frame 000030 files (local, gitignored; full-resolution views and context crops with projected GT boxes):
+
+- `data/scenes/overlays/blos_pedestrian_002-posthoc-000030-ego-1-cam4-full.png`
+- `data/scenes/overlays/blos_pedestrian_002-posthoc-000030-ego-1-cam4-crop.png`
+- `data/scenes/overlays/blos_pedestrian_002-posthoc-000030-rsu--1-cam2-full.png`
+- `data/scenes/overlays/blos_pedestrian_002-posthoc-000030-rsu--1-cam2-crop.png`
+
+Existing trace SHA-256: `eef54e2c0ae619d307772bf922c20d6aff2f8412a23a5a300cc561eed766bc7d`. The source trace and all existing scored rows remain unchanged.
