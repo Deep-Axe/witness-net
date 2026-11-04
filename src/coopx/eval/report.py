@@ -228,7 +228,7 @@ def _tracking_tables(study):
         "from capture to decision",
         "time; uncertainty grows with age and tracks expire at the four-second prediction cap. Free-space",
         "checks use the original capture position and time. A refutation remains attached to later updates",
-        "of that source/session/track, with its original evidence references. Local detections remain protected.",
+        "of that source/session/track, with its original evidence references. Witness local detections remain protected.",
         "",
         "### Paired strict scores (τ = 0)",
         "",
@@ -236,6 +236,21 @@ def _tracking_tables(study):
         "|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     rows = study.get("sweep", [])
+
+    strict_tracking = [
+        r
+        for r in rows
+        if r["variant"] == "SAM with tracking" and r["latency_tolerance_s"] == 0
+    ]
+    if strict_tracking and all(
+        r["metrics"].get("audited_occluded_recall") == 0 for r in strict_tracking
+    ):
+        index = lines.index("### Paired strict scores (τ = 0)")
+        lines[index:index] = [
+            "The current tracking result does not establish a hidden-target detection in either clip.",
+            "Spatial recall must be read alongside identity errors and the false-hazard regression.",
+            "",
+        ]
 
     def lead(m):
         values = [v for v in m.get("lead_us", {}).values() if v is not None]
@@ -257,6 +272,7 @@ def _tracking_tables(study):
             "",
             "Identity-specific checks on the strict SAM tracking rows (an additional audit,",
             "not a replacement for the spatial score or a change to attack scoring):",
+            "",
         ]
     )
     for row in rows:
