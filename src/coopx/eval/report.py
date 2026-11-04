@@ -26,12 +26,16 @@ def load_runs(results_dir: Path) -> list[dict]:
     return runs
 
 
-def render_summary(runs: list[dict], *, scene_review: dict | None = None) -> str:
+def render_summary(
+    runs: list[dict], *, scene_review: dict | None = None, study: dict | None = None
+) -> str:
     report_scenes = {run.get("scene") for run in runs if run.get("split") == "report"}
     approved = set((scene_review or {}).get("approved_scenes", ()))
     if report_scenes and report_scenes <= approved:
-        review_note = (f"The user approved these report clips after camera-view review on "
-                       f"{scene_review['date']}. This approves visual clip selection, not warning timing.")
+        review_note = (
+            f"The user approved these report clips after camera-view review on "
+            f"{scene_review['date']}. This approves visual clip selection, not warning timing."
+        )
     else:
         review_note = "Visual approval has not been supplied for every report clip in this summary."
     lines = [
@@ -71,6 +75,9 @@ def render_summary(runs: list[dict], *, scene_review: dict | None = None) -> str
         "visible; it is a comparison, not a result.",
         "",
     ]
+    if study:
+        lines[0] = "# Witness evaluation (S4b tracking; deterministic fusion, Muse off)"
+        lines.extend(_tracking_tables(study))
     lines.extend(_table(run for run in runs if run.get("perception", "sam") == "sam"))
     oracle = [run for run in runs if run.get("perception") == "gt-oracle"]
     if oracle:
@@ -80,15 +87,24 @@ def render_summary(runs: list[dict], *, scene_review: dict | None = None) -> str
         lines.extend(["", "## Errors and partial runs", ""])
         for run in runs:
             if run.get("error"):
-                lines.append(f"- {run.get('scene')} {run.get('perception')} {run.get('fusion')} "
-                             f"{run.get('attack') or '—'}: {run['error']}")
+                lines.append(
+                    f"- {run.get('scene')} {run.get('perception')} {run.get('fusion')} "
+                    f"{run.get('attack') or '—'}: {run['error']}"
+                )
     lines.append("")
     return "\n".join(lines)
 
 
 def _table(runs) -> list[str]:
-    rows = sorted(runs, key=lambda r: (r.get("split") != "report", r.get("scene", ""),
-                                       r.get("attack") or "", r.get("fusion", "")))
+    rows = sorted(
+        runs,
+        key=lambda r: (
+            r.get("split") != "report",
+            r.get("scene", ""),
+            r.get("attack") or "",
+            r.get("fusion", ""),
+        ),
+    )
     lines = [
         "| split | scene | attack | fusion | occluded recall | lead (s) | precision | TP | dup | false | out | flips | caught | msgs | indep. witnesses |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|",
@@ -100,15 +116,25 @@ def _table(runs) -> list[str]:
         sc = m.get("scores") or {}
         ind = m.get("independence") or {}
         leads = [v for v in (m.get("lead_us") or {}).values() if v is not None]
-        lines.append("| {split} | {scene} | {attack} | {fusion} | {recall} | {lead} | {precision} | {tp} | {dup} | {false} | {out} | {flips} | {caught} | {msgs} | {wit} |".format(
-            split=run.get("split", ""), scene=run.get("scene", ""), attack=run.get("attack") or "—",
-            fusion=run.get("fusion", ""), recall=_fmt(sc.get("occluded_recall")),
-            lead="n/a" if not leads else f"{min(leads) / 1e6:.1f}",
-            precision=_fmt(sc.get("precision")), tp=sc.get("true_positives", ""),
-            dup=sc.get("duplicates", ""), false=sc.get("false_hazards", ""),
-            out=sc.get("out_of_region", ""), flips=m.get("safety_flips", ""),
-            caught=_caught(m.get("attack_caught")), msgs=ind.get("messages", ""),
-            wit=ind.get("independent_witnesses", "")))
+        lines.append(
+            "| {split} | {scene} | {attack} | {fusion} | {recall} | {lead} | {precision} | {tp} | {dup} | {false} | {out} | {flips} | {caught} | {msgs} | {wit} |".format(
+                split=run.get("split", ""),
+                scene=run.get("scene", ""),
+                attack=run.get("attack") or "—",
+                fusion=run.get("fusion", ""),
+                recall=_fmt(sc.get("occluded_recall")),
+                lead="n/a" if not leads else f"{min(leads) / 1e6:.1f}",
+                precision=_fmt(sc.get("precision")),
+                tp=sc.get("true_positives", ""),
+                dup=sc.get("duplicates", ""),
+                false=sc.get("false_hazards", ""),
+                out=sc.get("out_of_region", ""),
+                flips=m.get("safety_flips", ""),
+                caught=_caught(m.get("attack_caught")),
+                msgs=ind.get("messages", ""),
+                wit=ind.get("independent_witnesses", ""),
+            )
+        )
     return lines
 
 
@@ -124,17 +150,35 @@ def _scene_review(scene_manifest: Path) -> dict | None:
         if not item.get("approved_for_report"):
             continue
         for scene in manifest.get("scenes", []):
-            if (scene["name"] == item["scene"] and scene["scenario"] == item["scenario"]
-                    and scene["ego_id"] == item["ego_id"]
-                    and any(t["gt_id"] == item["gt_id"] for t in scene["targets"])
-                    and scene["hidden_interval"].get(item["gt_id"], [None])[0] == item["frame_id"]
-                    and any(o[1:] == [item["rsu_agent"], item["rsu_camera"]] for o in scene["observers"])):
+            if (
+                scene["name"] == item["scene"]
+                and scene["scenario"] == item["scenario"]
+                and scene["ego_id"] == item["ego_id"]
+                and any(t["gt_id"] == item["gt_id"] for t in scene["targets"])
+                and scene["hidden_interval"].get(item["gt_id"], [None])[0]
+                == item["frame_id"]
+                and any(
+                    o[1:] == [item["rsu_agent"], item["rsu_camera"]]
+                    for o in scene["observers"]
+                )
+            ):
                 approved.append(scene["name"])
     return {"date": review["reviewed_on"], "approved_scenes": approved}
 
 
-def write_summary(results_dir: Path, out: Path, *, scene_manifest: Path = Path("data/scenes/scenes.json")) -> str:
-    text = render_summary(load_runs(results_dir), scene_review=_scene_review(Path(scene_manifest)))
+def write_summary(
+    results_dir: Path,
+    out: Path,
+    *,
+    scene_manifest: Path = Path("data/scenes/scenes.json"),
+    study_path: Path | None = None,
+) -> str:
+    study = json.loads(Path(study_path).read_text()) if study_path is not None else None
+    text = render_summary(
+        load_runs(results_dir),
+        scene_review=_scene_review(Path(scene_manifest)),
+        study=study,
+    )
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
@@ -149,11 +193,15 @@ def _ego_note(runs) -> str:
         note = path.parents[1] / "ego-000096.json"
         if note is not None and note.is_file():
             data = json.loads(note.read_text(encoding="utf-8"))
-            cams = ", ".join(f"{name}={state}" for name, state in data.get("cameras", {}).items())
-            return (f"Frame {data.get('frame_id')} pedestrian {data.get('pedestrian_id')}: {cams}. "
-                    f"SAM on {data.get('camera')} published {data.get('published', 0)}; "
-                    f"nearest lift {data.get('nearest_m')} m; cost ${data.get('cost_usd', 0)}. "
-                    f"{data.get('note', '')}")
+            cams = ", ".join(
+                f"{name}={state}" for name, state in data.get("cameras", {}).items()
+            )
+            return (
+                f"Frame {data.get('frame_id')} pedestrian {data.get('pedestrian_id')}: {cams}. "
+                f"SAM on {data.get('camera')} published {data.get('published', 0)}; "
+                f"nearest lift {data.get('nearest_m')} m; cost ${data.get('cost_usd', 0)}. "
+                f"{data.get('note', '')}"
+            )
     return ""
 
 
@@ -167,3 +215,249 @@ def _caught(value) -> str:
     if value is None:
         return "—"
     return "yes" if value else "no"
+
+
+def _tracking_tables(study):
+    lines = [
+        "## Tracking and decision-time prediction",
+        "",
+        "Tracking uses only lifted detections already available to the observer. Each camera assigns stable",
+        "IDs and signs a velocity estimate and its uncertainty. Model completions are processed in availability",
+        "order. Older positives remain evidence, while an older measurement cannot overwrite a newer position.",
+        "Only past captures enter a signed velocity estimate. Consumers predict",
+        "from capture to decision",
+        "time; uncertainty grows with age and tracks expire at the four-second prediction cap. Free-space",
+        "checks use the original capture position and time. A refutation remains attached to later updates",
+        "of that source/session/track, with its original evidence references. Witness local detections remain protected.",
+        "",
+        "### Paired strict scores (τ = 0)",
+        "",
+        "| clip | perception | occluded recall | lead (s) | decision error mean (m) | precision | false hazards | duplicates | wrong / ambiguous / unknown / hits |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    rows = study.get("sweep", [])
+
+    strict_tracking = [
+        r
+        for r in rows
+        if r["variant"] == "SAM with tracking" and r["latency_tolerance_s"] == 0
+    ]
+    if strict_tracking and all(
+        r["metrics"].get("audited_occluded_recall") == 0 for r in strict_tracking
+    ):
+        index = lines.index("### Paired strict scores (τ = 0)")
+        lines[index:index] = [
+            "The current tracking result does not establish a hidden-target detection in either clip.",
+            "Spatial recall must be read alongside identity errors and the false-hazard regression.",
+            "",
+        ]
+
+    def lead(m):
+        values = [v for v in m.get("lead_us", {}).values() if v is not None]
+        return "n/a" if not values else f"{min(values) / 1e6:.1f}"
+
+    for row in rows:
+        if row["latency_tolerance_s"] != 0:
+            continue
+        m = row["metrics"]
+        s = m["scores"]
+        lines.append(
+            f"| {row['scene']} | {row['variant']} | {_fmt(s['occluded_recall'])} | {lead(m)} | "
+            f"{_fmt(m['position_error_at_decision_m'])} | {_fmt(s['precision'])} | {s['false_hazards']} | {s['duplicates']} | "
+            f"{m['wrong_pedestrian_matches']} / {m['ambiguous_pedestrian_matches']} / "
+            f"{m['unknown_identity_matches']} / {m['occluded_matches']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Identity-specific checks on the strict SAM tracking rows (an additional audit,",
+            "not a replacement for the spatial score or a change to attack scoring):",
+            "",
+        ]
+    )
+    for row in rows:
+        if row.get("variant") != "SAM with tracking" or row["latency_tolerance_s"] != 0:
+            continue
+        m = row["metrics"]
+        audited = m.get("audited_occluded_recall")
+        values = [v for v in m.get("audited_lead_us", {}).values() if v is not None]
+        audit_lead = "n/a" if not values else f"{min(values) / 1e6:.1f} s"
+        lines.append(
+            f"- {row['scene']}: unambiguous target-match recall {_fmt(audited)}; "
+            f"identity-audited lead {audit_lead}."
+        )
+    lines += [
+        "",
+        "### Fixed latency-tolerance sweep",
+        "",
+        "**τ > 0 scores detection of a recent position, not the current position.**",
+        "",
+        "All rows use Witness fusion, identical seeds and the fixed τ = 0, 1, 2, 3, 4 s values on both clips.",
+        "The sweep re-scores identical belief traces against the 10 Hz trajectory within [t−τ, t],",
+        "interpolating only consecutive annotated samples and never crossing missing-label gaps;",
+        "radii stay 1.5 m / 3 m. Precision, false hazards and duplicates receive the same tolerance as recall.",
+        "Attack rows below always use τ = 0. Lead time uses actual packet availability; n/a remains censored.",
+        "",
+        "Wrong-pedestrian counts audit each SAM box against projected capture-time GT person boxes:",
+        "IoU must be at least 0.25, with a 0.10 lead over the second candidate for an unambiguous identity.",
+        "Only unambiguous non-target identities count as wrong; alternatives are ambiguous and absent",
+        "matches are unknown. Legacy traces use a weaker nearest-3D audit; gt-oracle knows its synthetic",
+        "identity. These audits never alter recall, tracking or prediction. An ambiguous or wrong identity",
+        "cannot support a claim that the labelled pedestrian was warned about, regardless of raw recall.",
+        "Decision error is distance to the current target for reports whose capture-time audit identifies",
+        "that target unambiguously; it includes misses and uses its current position. n/a means no such report.",
+        "",
+        "| clip | perception | τ (s) | occluded recall | lead (s) | decision error mean (m) | precision | false hazards | duplicates | wrong pedestrian / hits | ambiguous / unknown |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        m = row["metrics"]
+        s = m["scores"]
+        lines.append(
+            f"| {row['scene']} | {row['variant']} | {row['latency_tolerance_s']} | {_fmt(s['occluded_recall'])} | "
+            f"{lead(m)} | {_fmt(m['position_error_at_decision_m'])} | {_fmt(s['precision'])} | {s['false_hazards']} | "
+            f"{s['duplicates']} | {m['wrong_pedestrian_matches']} / {m['occluded_matches']} | "
+            f"{m['ambiguous_pedestrian_matches']} / {m['unknown_identity_matches']} |"
+        )
+    lines += [
+        "",
+        "### Parameters and provenance",
+        "",
+        study.get("parameter_source", ""),
+        "",
+        "The same parameters apply to both report clips. Speed limits (pedestrian 8, vehicle 60,",
+        "cyclist/unknown 20 m/s) are declared operating bounds, not claims of universal human/vehicle limits.",
+        "Association uses 3D uncertainty, box overlap and masked HSV histograms with global Hungarian",
+        "assignment and explicit unmatched detections; class, anchor and label must agree. Gates were",
+        "rounded above the 95th percentile of 75 non-target tuning pairs: two box diagonals per second,",
+        "0.7 Hellinger appearance distance and 5.5 combined cost. They are fixed across report clips.",
+        "Velocity uses a weighted least-squares fit over at most two seconds; position uncertainty supplies",
+        "measurement noise, fit residuals increase uncertainty, and velocity standard deviation has a 0.1 m/s floor.",
+        "The 1.5 m/s² acceleration process-noise assumption bounds confidence in the constant-velocity model;",
+        "uncertainty is not a wider scoring radius or a calibrated coverage guarantee.",
+        "There is no cross-camera appearance matching. Identity switches, sparse lift geometry, acceleration",
+        "and initial frames without a velocity estimate remain limitations. Prediction does not reduce model latency.",
+        "",
+    ]
+    for key, title in (("ledger_before", "Before"), ("ledger_after", "After")):
+        ledger = study.get(key, {})
+        lines.append(
+            f"{title} ledger: settled ${ledger.get('settled_usd', 0):.6f}; outstanding "
+            f"${ledger.get('outstanding_usd', 0):.6f}. Outstanding reservations were not released."
+        )
+    matrix = study.get("matrix", [])
+    witness = [r for r in matrix if r.get("fusion") == "witness"]
+    lines.extend(
+        [
+            "",
+            "### Safety and attacks",
+            "",
+            (
+                f"Across {len(witness)} Witness matrix runs: "
+                f"{sum(r['metrics']['safety_flips'] for r in witness)} local safety flips; "
+                f"{sum(r['metrics']['false_distrust'] for r in witness)} false distrust decisions."
+            ),
+            "The original caught metric checks the final decision. A track can expire before that decision;",
+            "the in-run hazard and refutation columns show whether attack evidence was ever used or refuted.",
+            "Expiry alone is not evidence that an attack was verified as false.",
+            "",
+            "| attack | before final caught / eligible | after final caught / eligible | hazard ticks after | refuted ticks after |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    baseline = study.get("baseline_runs", [])
+    for attack in sorted({r["attack"] for r in witness if r.get("attack")}):
+        after = [
+            r
+            for r in witness
+            if r.get("perception") == "sam" and r.get("attack") == attack
+        ]
+        before = [
+            r
+            for r in baseline
+            if r.get("fusion") == "witness"
+            and r.get("perception") == "sam"
+            and r.get("attack") == attack
+            and "metrics" in r
+        ]
+
+        def caught_count(rows):
+            eligible = [
+                r["metrics"]["attack_caught"]
+                for r in rows
+                if r["metrics"].get("attack_caught") is not None
+            ]
+            return f"{sum(eligible)} / {len(eligible)}" if eligible else "n/a"
+
+        lines.append(
+            f"| {attack} | {caught_count(before)} | {caught_count(after)} | "
+            f"{sum(r['metrics'].get('attack_hazard_ticks', 0) for r in after)} | "
+            f"{sum(r['metrics'].get('attack_refuted_ticks', 0) for r in after)} |"
+        )
+    calibration = study.get("calibration")
+    if calibration:
+        speed = calibration["speed_mps_p50_p90_p95_max"]
+        acceleration = calibration["velocity_change_mps2_p50_p90_max"]
+        lines.extend(
+            [
+                "",
+                "Calibration check on the tuning scene, excluding pedestrian 53 and ambiguous",
+                (
+                    f"capture-time identities: {calibration['reports']} reports, {calibration['motion_estimates']} velocity estimates; "
+                    f"speed p50/p90/max = {speed[0]:.3f}/{speed[1]:.3f}/{speed[3]:.3f} m/s. "
+                    f"Maximum change in fitted velocity = {acceleration[2]:.3f} m/s²."
+                ),
+                (
+                    f"{calibration['multi_identity_tracks']} of {calibration['tracks']} audited tracks changed their nearest "
+                    "GT identity. The audit uses camera projection and can itself be ambiguous; it is not an identity oracle."
+                ),
+                "Sticky refutation can therefore follow an incorrect association; the zero-false-distrust gate",
+                "on these clips does not establish that this cannot happen in other crowded scenes.",
+                "",
+            ]
+        )
+    diagnostics = study.get("diagnostics")
+    if diagnostics:
+        lines.extend(
+            [
+                "",
+                "### Source-data checks",
+                "",
+                "These checks use the original cached SAM results and capture-time geometry. No tracking",
+                "parameter, scoring radius or visibility interval was changed for these diagnoses.",
+                "",
+                "| clip | labelled hidden interval (s) | target movement in it (m) | first unambiguous target SAM result available (s) | its lift error at capture (m) | ego first visible (s) |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for motion in diagnostics["motion"]:
+            observations = [
+                r
+                for r in diagnostics["sam"]
+                if r["scene"] == motion["scene"]
+                and r.get("identified_as") == motion["target"]
+                and not r.get("ambiguous")
+                and r.get("best_iou", 0) >= 0.25
+            ]
+            first = (
+                min(observations, key=lambda r: r["available_s"])
+                if observations
+                else None
+            )
+            lines.append(
+                f"| {motion['scene']} | {motion['hidden_start_s']:.1f}–{motion['hidden_end_s']:.1f} | "
+                f"{motion['max_movement_m']:.3f} | {_fmt(first['available_s'] if first else None)} | "
+                f"{_fmt(first['capture_error_m'] if first else None)} | {_fmt(motion['ego_visible_s'])} |"
+            )
+        lines.extend(
+            [
+                "",
+                "Availability in this table is the SAM result time, before the additional transport delay.",
+                "An inference result arriving after the labelled hidden interval cannot gain earlier recall through",
+                "tracking or τ scoring. A wrong/ambiguous instance or a bias already present in a capture-time lift",
+                "also cannot be attributed solely to motion during API latency. None of these checks changes the score.",
+                "",
+            ]
+        )
+    lines += ["", "## Strict attack matrix (τ = 0)", ""]
+    return lines
