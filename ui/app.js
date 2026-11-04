@@ -585,10 +585,71 @@ function jumpToRef(ref) {
   if (idx >= 0) select(idx);
 }
 
+function stories(t) {
+  return until(t).filter((e) => e.type === "map_snapshot" && e.detail && e.detail.story);
+}
+
+function currentStory() {
+  const found = stories(state.t);
+  return found.length ? found[found.length - 1].detail.story : null;
+}
+
+function jumpToBeat(beat) {
+  const event = state.events.find((e) => e.detail && e.detail.story && e.detail.story.beat === beat);
+  if (!event) return;
+  state.t = event.t_replay_us;
+  $("scrub").value = String(state.t);
+  render();
+}
+
+function renderBadge() {
+  const badge = $("mode-badge");
+  if (!badge) return;
+  const story = currentStory();
+  const snapshot = story ? story.mode === "snapshot" : until(state.t).some(
+    (e) => e.type === "check" && e.detail && e.detail.mode === "snapshot");
+  badge.textContent = snapshot ? "Paused snapshot Q&A" : "Causal replay";
+  badge.className = snapshot ? "badge snapshot" : "badge";
+}
+
+function renderBeats() {
+  const host = $("beats");
+  if (!host) return;
+  const names = [];
+  for (const event of state.events) {
+    const beat = event.detail && event.detail.story && event.detail.story.beat;
+    if (beat && !names.includes(beat)) names.push(beat);
+  }
+  clear(host);
+  for (const beat of names) {
+    const button = el("button", "", beat.replaceAll("_", " "));
+    button.type = "button";
+    button.addEventListener("click", () => jumpToBeat(beat));
+    host.appendChild(button);
+  }
+}
+
 function renderReasoner() {
   const host = $("reasoner");
   if (!host) return;
   clear(host);
+  const story = currentStory();
+  if (story) {
+    host.appendChild(el("h3", "", story.title || story.beat));
+    host.appendChild(el("p", "", story.body || ""));
+    if (story.witnesses != null) {
+      host.appendChild(el("p", "", `Independent witnesses: ${story.witnesses}`));
+    }
+    for (const belief of story.beliefs || []) {
+      const bits = [`${belief.local ? "local" : "remote"} ${belief.cls} ${belief.state}`];
+      if (belief.track_id != null) bits.push(`track ${belief.track_id}`);
+      if (Array.isArray(belief.velocity)) bits.push(`v ${belief.velocity.map((v) => Number(v).toFixed(1)).join(",")}`);
+      if (Array.isArray(belief.predicted_xy)) bits.push(`next ${belief.predicted_xy.map((v) => Number(v).toFixed(1)).join(",")}`);
+      host.appendChild(el("p", "belief", bits.join(" · ")));
+    }
+  }
+  const museOn = !$("muse") || $("muse").checked;
+  if (!museOn) host.appendChild(el("p", "muted", "Muse off. Hazards use the deterministic path only."));
   const evs = until(state.t);
   const asked = evs.find((e) => (e.type === "query" || e.type === "model_call")
     && typeof e.detail.question === "string");
@@ -623,7 +684,7 @@ function renderReasoner() {
     host.appendChild(row);
   }
   host.appendChild(el("h3", "", "Verdict"));
-  const verdicts = evs.filter((e) => e.type === "verdict");
+  const verdicts = museOn ? evs.filter((e) => e.type === "verdict") : [];
   if (!verdicts.length) host.appendChild(el("p", "muted", "No verdict yet."));
   for (const event of verdicts) {
     host.appendChild(el("p", "", `${event.state} · ${event.detail.reason || ""}`));
@@ -635,12 +696,15 @@ function renderReasoner() {
     }
   }
   host.appendChild(el("h3", "", "Model calls"));
-  const calls = evs.filter((e) => e.type === "model_call");
-  if (!calls.length) host.appendChild(el("p", "muted", "No model calls yet."));
+  const calls = museOn ? evs.filter((e) => e.type === "model_call") : [];
+  if (!calls.length) host.appendChild(el("p", "muted", museOn ? "No model calls yet." : "Model calls hidden while Muse is off."));
   for (const event of calls) {
     const d = event.detail;
-    const line = `${d.product} ${d.stage} · ${Math.round(d.latency_ms)} ms · cache ${d.cache_hit} · $${d.cost_usd.toFixed(4)}`;
-    host.appendChild(el("p", "", line));
+    const line = el("p", "");
+    line.appendChild(document.createTextNode(
+      `${d.product} ${d.stage} · ${Math.round(d.latency_ms)} ms · $${Number(d.cost_usd).toFixed(4)} · `));
+    line.appendChild(el("span", d.cache_hit ? "tag-cache" : "tag-live", d.cache_hit ? "cached" : "live"));
+    host.appendChild(line);
   }
 }
 
@@ -658,6 +722,7 @@ function render() {
   renderTable();
   renderMap();
   renderReasoner();
+  renderBadge();
 }
 
 function select(index) {
@@ -700,6 +765,7 @@ function setLog(text, label) {
     filters.appendChild(button);
   }
   showEvidence("Click a cell or assessed object.", []);
+  renderBeats();
   const img = $("s3-overlay");
   if (img) {
     img.hidden = true;
@@ -750,6 +816,23 @@ $("filters").addEventListener("click", (ev) => {
   render();
 });
 $("map").addEventListener("click", onMapClick);
+if ($("ask")) {
+  $("ask").addEventListener("click", () => {
+    jumpToBeat("question");
+    const typed = ($("question").value || "").trim();
+    const story = currentStory();
+    if (typed && story && !String(story.body || "").includes(typed) && typed.length > 12) {
+      $("load-status").textContent = "This replay answers the recorded question. A new question needs another plan.";
+    }
+  });
+}
+if ($("attack")) {
+  $("attack").addEventListener("change", () => {
+    if ($("attack").value) jumpToBeat($("attack").value);
+  });
+}
+if ($("disconnect")) $("disconnect").addEventListener("click", () => jumpToBeat("disconnect"));
+if ($("muse")) $("muse").addEventListener("change", render);
 
 const params = new URLSearchParams(location.search);
 const log = params.get("log");

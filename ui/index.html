@@ -9,14 +9,15 @@
 <body>
   <header class="top">
     <div>
-      <h1>CoopX S3</h1>
-      <p class="tag">Signed observation → checker → SAM / Reasoner → verdict</p>
+      <h1>Witness</h1>
+      <p class="tag">Hidden pedestrian → check → ask → attacks, Muse off the fast path</p>
     </div>
     <label class="file">
       Load JSONL
       <input id="file" type="file" accept=".jsonl,.json,.txt">
     </label>
-    <div id="load-status" class="status">Open <code>?log=/data/s2-events.jsonl</code> or pick a file.</div>
+    <div id="mode-badge" class="badge">Causal replay</div>
+    <div id="load-status" class="status">Open <code>?log=/data/s4b-agent-b/demo-events.jsonl</code> or pick a file.</div>
   </header>
 
   <section class="counters" id="counters">
@@ -34,6 +35,21 @@
     <button id="play" type="button">Play</button>
     <input id="scrub" type="range" min="0" max="0" value="0">
     <span id="clock">t = 0 µs</span>
+  </section>
+  <section class="controls">
+    <div id="beats" class="beats"></div>
+    <label>Question <input id="question" type="text" placeholder="Ask about the hidden pedestrian"></label>
+    <button id="ask" type="button">Ask</button>
+    <label>Attack
+      <select id="attack">
+        <option value="">none</option>
+        <option value="ghost_free">ghost, Muse off</option>
+        <option value="sybil">sybil</option>
+        <option value="remote_clear">remote clear</option>
+      </select>
+    </label>
+    <button id="disconnect" type="button">Disconnect observer</button>
+    <label class="toggle"><input id="muse" type="checkbox" checked> Muse on</label>
   </section>
 
   <main class="grid">

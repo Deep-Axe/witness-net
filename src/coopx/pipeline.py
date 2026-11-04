@@ -231,6 +231,15 @@ def _write_events(path: Path, events: list[dict], *, overwrite: bool = False) ->
 # S2 helpers: signed coverage, events
 # ---------------------------------------------------------------------------
 
+def _signed_coverage_window(source: str, key: NodeKey, content: CoverageContent, *, sim_us: int,
+                           ttl_us: int, sensor_seq: int, message_id: str) -> CoverageMessage:
+    envelope = Envelope(
+        2, "coverage", message_id, source, S2_SESSION, S2_FRAME,
+        sim_us, sim_us, sim_us + ttl_us, Auth(f"{source}-key"), sensor_seq)
+    lineage = Lineage(source, "lidar", message_id, sim_us, derivation="direct")
+    return sign(CoverageMessage(envelope, content, lineage), key)
+
+
 def _signed_coverage(source: str, key: NodeKey, content: CoverageContent, *, sim_us: int,
                      sensor_seq: int, message_id: str) -> CoverageMessage:
     envelope = Envelope(
@@ -900,7 +909,9 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
             return 0
         return max(store.independent_witnesses(m, messages) for m in messages)
 
-    reasoner = Reasoner(client, independent=independent)
+    clock = {"us": t_q}
+    reasoner = Reasoner(client, independent=independent,
+                        contradicts=range_contradicts_callback(store, coverage_map, clock))
     queries, plan_result = reasoner.plan(question, capabilities, context, t_q)
     plan_event = model_call_event(plan_result, "reasoner")
     plan_event["detail"]["question"] = question
@@ -979,6 +990,7 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
                 "capture_time_us": message.envelope.capture_time_us,
                 "availability_time_us": message.envelope.generation_time_us,
             }
+    clock["us"] = answers_us
     verdicts, judge_result = reasoner.judge(question, queries, answers, evidence, answers_us)
     events.append(model_call_event(judge_result, "reasoner"))
     for verdict in verdicts:
@@ -1029,3 +1041,611 @@ def run_s3(output: Path, *, offline: bool = False, key_seed: int = 0,
             1 for e in events if e["type"] == "check"
             and e["detail"].get("mode") == "snapshot" and e["state"] == "accepted"),
     }
+
+
+def range_contradicts_callback(store, coverage_map, clock):
+    """Reasoner `contradicts(detection_ref, coverage_ref)`. Fail closed.
+
+    The callback validates the admitted packets through the real range proof.
+    A missing map, a bad reference, or any error is not a contradiction.
+    """
+    from coopx.observers.lidar_real import range_contradicts
+
+    def contradicts(detection_ref, coverage_ref):
+        try:
+            now = clock.get("us") if isinstance(clock, dict) else None
+            if (store is None or coverage_map is None or type(now) is not int
+                    or type(detection_ref) is not str or type(coverage_ref) is not str):
+                return False
+            return bool(range_contradicts(
+                store, coverage_map, detection_ref, coverage_ref, now))
+        except Exception:
+            return False
+    return contradicts
+
+
+DEMO_CLIPS = (
+    {"name": "blos_pedestrian_001", "frame": "000029", "gt_id": "81"},
+    {"name": "blos_pedestrian_002", "frame": "000000", "gt_id": "138"},
+)
+DEMO_QUESTION = ("Is a pedestrian hidden from the car but visible from a roadside camera?")
+
+
+def run_demo(output: Path, *, offline: bool = False, budget_usd: float = 5.0,
+             key_seed: int = 0, overwrite: bool = False, client=None,
+             compare: bool = True) -> dict:
+    """Replay the two human-approved clips as one local demo log."""
+    _require_output(output, overwrite)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    events: list[dict] = []
+    clips = []
+    for index, clip in enumerate(DEMO_CLIPS):
+        part = _demo_clip(clip, index, offline=offline, budget_usd=budget_usd,
+                          key_seed=key_seed, client=client)
+        events.extend(part.pop("events"))
+        clips.append(part)
+    comparison = None
+    if compare:
+        from coopx.eval.muse_compare import write_comparison
+        comparison = write_comparison(
+            Path("data/s4b-agent-b/muse-comparison.json"),
+            Path("results/muse-comparison.md"),
+            offline=offline, budget_usd=budget_usd, client=client, key_seed=key_seed)
+    events = _write_events(output, events, overwrite=overwrite)
+    from coopx.events import validate
+    for event in events:
+        validate(event)
+    return {"events": str(output), "n_events": len(events), "clips": clips,
+            "comparison": comparison}
+
+
+def _demo_scene(name):
+    import json
+    path = Path("data/scenes/scenes.json")
+    if not path.is_file():
+        raise FileNotFoundError("data/scenes/scenes.json is not present")
+    for scene in json.loads(path.read_text(encoding="utf-8"))["scenes"]:
+        if scene["name"] == name:
+            return scene
+    raise ValueError(f"unknown scene {name}")
+
+
+def _demo_clip(spec, index, *, offline, budget_usd, key_seed, client):
+    """One clip: fast path, snapshot question, then attacks with Muse off."""
+    from coopx.dataset.v2xreal import V2XReal
+    from coopx.eval.fusion import fuse
+    from coopx.meta.client import BudgetExceeded, CacheMiss, MetaAPIError, MetaClient
+    from coopx.meta.client import model_call_event
+    from coopx.meta.reasoner import ObserverUnavailable, Reasoner, execute
+    from coopx.observers.camera import CameraObserver, jpeg_to_camera_frame, rsu_camera_capability
+    from coopx.observers.camera_lift import lift_box
+    from coopx.observers.footprint import camera_footprint
+    from coopx.observers.lidar_real import lidar_coverage_sliced
+    from coopx.query import Answer, answer_query, inside_polygon
+    scene = _demo_scene(spec["name"])
+    dataset = V2XReal(S3_DATASET)
+    frame_id = spec["frame"]
+    ego = dataset.read(scene["scenario"], scene["ego_id"], frame_id)
+    rsu_obs = scene["observers"][0]
+    rsu_agent, rsu_cam = rsu_obs[1], rsu_obs[2]
+    rsu = dataset.read(scene["scenario"], rsu_agent, frame_id)
+    target = _demo_target(dataset, scene, frame_id, spec["gt_id"])
+    capture = int(ego.nominal_time_us)
+    base = capture + index * 1_000
+    keys = {name: demo_node_key(key_seed, name) for name in ("ego", "rsu-1", "rsu-2")}
+    anchors = {name: TrustAnchor(keys[name].public_key, f"{name}-key", TrustClass.A,
+                                 physical_observer=name, permitted_region=S3_REGION, anchored=True)
+               for name in keys}
+    points = [target["xy"], (float(ego.lidar_to_site[0, 3]), float(ego.lidar_to_site[1, 3]))]
+    grid = _demo_grid(points)
+    store = EvidenceStore(anchors)
+    # Beats span the replay. This window is the coverage message's own expiry,
+    # not a claim that free space lasts forever.
+    coverage_map = CoverageMap(grid, ttl_us=120_000_000, spatial_frame_id=S2_FRAME, store=store)
+    if client is None:
+        client = MetaClient(budget_usd=budget_usd, offline=offline)
+    events = []
+    published = []
+    errors = []
+    ego_cams = tuple(c for c in ("cam1", "cam2", "cam3", "cam4") if c in ego.cameras) or tuple(ego.cameras)
+    jobs = [("ego", ego, cam, i * 100) for i, cam in enumerate(ego_cams)]
+    rsu_id = "rsu-1" if rsu_agent == "-1" else "rsu-2"
+    if rsu_id not in keys:
+        keys[rsu_id] = demo_node_key(key_seed, rsu_id)
+    jobs.append((rsu_id, rsu, rsu_cam, 0))
+    observers = []
+    for observer_id, agent, cam, origin in jobs:
+        observer = CameraObserver(
+            observer_id, lambda a=agent, c=cam: jpeg_to_camera_frame(a, c),
+            cam, client, lift_box, keys[observer_id], session="s4b",
+            ttl_us=S3_TTL_US, period_us=500_000, seq_origin=origin)
+        observers.append(observer)
+        try:
+            published.extend(observer.observe())
+        except (CacheMiss, MetaAPIError, BudgetExceeded, OSError) as exc:
+            errors.append(f"{observer_id} {cam}: {type(exc).__name__}: {exc}")
+            if isinstance(exc, BudgetExceeded):
+                break
+        events.extend(observer.drain_events())
+    checker = Checker(anchors, ttl_us=S3_TTL_US)
+    admitted = []
+    shown = base
+    for message in published:
+        raw = encode(message)
+        now = max(base, message.envelope.generation_time_us)
+        delivery = PacketDelivery(message.envelope.source_id, "ego", now, now, raw,
+                                  message.envelope.message_id, "observation",
+                                  packet_hash(raw))
+        result = checker.check(raw, now)
+        events.append(_check_event(delivery, result, now))
+        shown = max(shown, now)
+        if result.state == "accepted" and isinstance(result.message, ObservationMessage):
+            admitted.append(result.message)
+            store.add(result.message)
+    cover_src = rsu
+    try:
+        slices = lidar_coverage_sliced(
+            cover_src, grid, capture_us=capture, window_us=(max(0, capture - 100_000), capture),
+            max_range_m=80.0)
+    except Exception as exc:
+        slices = []
+        errors.append(f"lidar: {type(exc).__name__}: {exc}")
+    for index_s, content in enumerate(slices):
+        try:
+            message = _signed_coverage_window(
+                rsu_id, keys[rsu_id], content, sim_us=capture, ttl_us=120_000_000,
+                sensor_seq=1000 + index_s, message_id=f"{rsu_id}-cov-{index_s}")
+        except ValueError:
+            continue
+        raw = encode(message)
+        delivery = PacketDelivery(rsu_id, "ego", base, base, raw, message.envelope.message_id,
+                                  "coverage", packet_hash(raw))
+        result = checker.check(raw, base)
+        events.append(_check_event(delivery, result, base))
+        if result.state == "accepted":
+            try:
+                coverage_map.add(result.message, base)
+                store.add(result.message)
+            except ValueError as exc:
+                errors.append(f"coverage: {exc}")
+    ghost_note = _inject_ghost(
+        coverage_map, store, anchors, key_seed, target, capture, events)
+    for message in admitted:
+        try:
+            coverage_map.add_observation(message, max(shown, capture + 200_000))
+        except ValueError:
+            pass
+    ego_obs = [m for m in admitted if m.envelope.source_id == "ego"]
+    remote = [m for m in admitted if m.envelope.source_id != "ego"]
+    assessor = Assessor(store, coverage_map)
+    try:
+        tick = max(shown, capture + 200_000)
+        ego_beliefs = fuse("ego", ego_observations=ego_obs, remote_admitted=remote,
+                           store=store, coverage_map=coverage_map, assessor=assessor, now_us=tick)
+        witness_beliefs = fuse("witness", ego_observations=ego_obs, remote_admitted=remote,
+                               store=store, coverage_map=coverage_map, assessor=assessor, now_us=tick)
+    except Exception as exc:
+        ego_beliefs, witness_beliefs = [], []
+        errors.append(f"fuse: {type(exc).__name__}: {exc}")
+    nearest = _nearest_pedestrian(ego_obs, target["xy"])
+    hidden = nearest is None or nearest > 1.5
+    observers_xy = [
+        {"id": "ego", "xy": [round(float(ego.lidar_to_site[0, 3]), 2),
+                             round(float(ego.lidar_to_site[1, 3]), 2)]},
+        {"id": rsu_id, "xy": [round(float(rsu.lidar_to_site[0, 3]), 2),
+                              round(float(rsu.lidar_to_site[1, 3]), 2)]},
+    ]
+    tick = max(shown, capture + 200_000)
+    events.append(_story(coverage_map, tick + 1, observers_xy, {
+        "beat": "hidden", "mode": "causal", "muse": False,
+        "title": f"{spec['name']}: hidden pedestrian",
+        "body": (f"Target {spec['gt_id']} at frame {frame_id}. "
+                 f"Ego-only nearest pedestrian {nearest if nearest is not None else 'none'} m. "
+                 f"{'The car misses it.' if hidden else 'The car has a detection within 1.5 m.'} "
+                 + ("; ".join(errors) if errors else "")),
+        "beliefs": [_public_belief(b) for b in ego_beliefs],
+        "target_xy": list(target["xy"]),
+    }))
+    events.append(_story(coverage_map, tick + 2, observers_xy, {
+        "beat": "discover", "mode": "causal", "muse": False,
+        "title": "Observers",
+        "body": f"Ego cameras {', '.join(ego_cams)}. Roadside {rsu_id} {rsu_cam}.",
+        "beliefs": [_public_belief(b) for b in witness_beliefs],
+        "target_xy": list(target["xy"]),
+    }))
+    attack_notes = {"ghost_free": ghost_note}
+    events.append(_story(coverage_map, tick + 3, observers_xy, {
+        "beat": "ghost_free", "mode": "causal", "muse": False,
+        "title": "Ghost, Muse off",
+        "body": ("LiDAR free space contradicts the ghost. The rejection is deterministic and does not wait on Muse."
+                 if ghost_note.get("contradicted") else
+                 "Muse is off. The range proof did not contradict this ghost, so it stays unverified."),
+        "beliefs": [],
+        "witnesses": ghost_note.get("witnesses"),
+        "target_xy": list(target["xy"]),
+    }))
+    attack_events, later_notes = _demo_attacks(
+        spec, target, ego_obs, remote, store, coverage_map, assessor, anchors, keys,
+        key_seed, shown, grid)
+    attack_notes.update(later_notes)
+    events.extend(attack_events)
+    qa = _demo_question(
+        spec, scene, ego, rsu, rsu_id, rsu_cam, target, client, keys, anchors,
+        checker, store, coverage_map, shown, observers)
+    events.extend(qa["events"])
+    events.append(_story(coverage_map, base + 120_000_000, observers_xy, {
+        "beat": "robot", "mode": "causal", "muse": False,
+        "title": "Robot without an LLM",
+        "body": "Same admitted observations and the deterministic checker. No model call on this beat.",
+        "beliefs": [_public_belief(b) for b in witness_beliefs],
+        "target_xy": list(target["xy"]),
+    }))
+    return {
+        "events": events,
+        "name": spec["name"],
+        "ego_miss": hidden,
+        "nearest_m": nearest,
+        "errors": errors,
+        "question": qa.get("summary"),
+        "attacks": attack_notes,
+        "single_source": qa.get("single_source"),
+    }
+
+
+def _demo_target(dataset, scene, frame_id, gt_id):
+    agents = [scene["ego_id"], scene["observers"][0][1], "2", "-2", "1", "-1"]
+    seen = []
+    for agent in dict.fromkeys(agents):
+        try:
+            frame = dataset.read(scene["scenario"], agent, frame_id)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        seen.append(agent)
+        box = frame.boxes.get(gt_id)
+        if box is not None:
+            center = box.center_site()
+            return {"xy": (float(center[0]), float(center[1])), "z": float(center[2]),
+                    "agent": agent}
+    raise ValueError(f"target {gt_id} is not in frame {frame_id}; looked at {seen}")
+
+
+def _demo_grid(points):
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    origin_x = math.floor(min(xs) - 40)
+    origin_y = math.floor(min(ys) - 40)
+    nx = min(180, max(20, int(math.ceil(max(xs) + 40) - origin_x)))
+    ny = min(180, max(20, int(math.ceil(max(ys) + 40) - origin_y)))
+    return GridSpec(float(origin_x), float(origin_y), 1.0, nx, ny)
+
+
+def _nearest_pedestrian(messages, xy):
+    best = None
+    for message in messages:
+        if message.observation.cls != ObjectClass.PEDESTRIAN:
+            continue
+        dist = math.dist(message.observation.xyz_m[:2], xy)
+        best = dist if best is None else min(best, dist)
+    return None if best is None else round(best, 3)
+
+
+def _public_belief(belief):
+    item = {"xy": [belief.xy[0], belief.xy[1]], "cls": belief.cls, "local": belief.local,
+            "state": belief.state, "refs": list(belief.refs)}
+    extra = getattr(belief, "track_id", None)
+    if extra is not None:
+        item["track_id"] = extra
+    velocity = getattr(belief, "velocity", None)
+    if velocity is not None:
+        item["velocity"] = list(velocity)
+    predicted = getattr(belief, "predicted_xy", None)
+    if predicted is not None:
+        item["predicted_xy"] = list(predicted)
+    return item
+
+
+def _belief_from_message(message, local, state):
+    from coopx.eval.fusion import Belief
+    belief = Belief(tuple(message.observation.xyz_m[:2]), message.observation.cls.name,
+                    local, state, (packet_hash(encode(message)),))
+    return _public_belief(belief)
+
+
+def _story(coverage_map, now_us, observers, story):
+    event = _map_snapshot_event(coverage_map, now_us, observers)
+    event["detail"]["story"] = story
+    return event
+
+
+def _covers(frame, camera, xy):
+    from coopx.observers.footprint import camera_footprint
+    from coopx.query import inside_polygon
+    try:
+        polygon = camera_footprint(frame, camera)
+    except Exception:
+        return False
+    return bool(polygon) and inside_polygon((float(xy[0]), float(xy[1])), polygon)
+
+
+def _demo_question(spec, scene, ego, rsu, rsu_id, rsu_cam, target, client, keys, anchors,
+                   checker, store, coverage_map, base, observers):
+    from coopx.meta.client import model_call_event
+    from coopx.meta.reasoner import Reasoner, execute
+    from coopx.observers.camera import rsu_camera_capability
+    from coopx.query import Answer, answer_query
+    events = []
+    covering = []
+    if _covers(rsu, rsu_cam, target["xy"]):
+        covering.append((rsu_id, rsu, rsu_cam))
+    for cam in ego.cameras:
+        if _covers(ego, cam, target["xy"]):
+            covering.append(("ego", ego, cam))
+    bodies = {item[0] for item in covering}
+    single = len(bodies) < 2
+    capabilities = []
+    for observer_id, frame, cam in covering:
+        try:
+            capabilities.append(rsu_camera_capability(observer_id, frame, cam))
+        except Exception:
+            continue
+    summary = {"single_source": single, "observers": [c.observer_id for c in capabilities]}
+    if not capabilities:
+        events.append(_story(coverage_map, base + 3_000_000, [], {
+            "beat": "question", "mode": "snapshot", "muse": True,
+            "title": "Paused snapshot Q&A",
+            "body": "No demonstrated footprint covers the target, so nothing is asked.",
+            "beliefs": [], "target_xy": list(target["xy"]),
+        }))
+        summary["asked"] = False
+        return {"events": events, "summary": summary, "single_source": True}
+    clock = {"us": base + 40_000_000}
+    def independent(refs):
+        messages = [store.get(ref) for ref in refs]
+        messages = [m for m in messages if isinstance(m, ObservationMessage)]
+        if not messages:
+            return 0
+        return max(store.independent_witnesses(m, messages) for m in messages)
+    reasoner = Reasoner(client, independent=independent,
+                        contradicts=range_contradicts_callback(store, coverage_map, clock))
+    context = {
+        "time_us": int(ego.nominal_time_us),
+        "asked_region": {"center": [round(target["xy"][0], 2), round(target["xy"][1], 2)],
+                         "radius_m": 4.0},
+        "physical_observers": {item[0]: item[0] for item in covering},
+    }
+    try:
+        queries, plan_result = reasoner.plan(DEMO_QUESTION, capabilities, context, clock["us"])
+    except Exception as exc:
+        events.append(_story(coverage_map, clock["us"], [], {
+            "beat": "question", "mode": "snapshot", "muse": True,
+            "title": "Paused snapshot Q&A",
+            "body": f"Plan failed ({type(exc).__name__}: {exc}). "
+                    + ("Only one physical observer covers the target, so a verdict would stay single-source."
+                       if single else ""),
+            "beliefs": [], "target_xy": list(target["xy"]),
+        }))
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        return {"events": events, "summary": summary, "single_source": single}
+    plan_event = model_call_event(plan_result, "reasoner")
+    plan_event["detail"]["question"] = DEMO_QUESTION
+    events.append(plan_event)
+    by_id = {obs.observer_id: obs for obs in observers}
+    caps = {cap.observer_id: cap for cap in capabilities}
+
+    def call(observer_id, query):
+        observer = by_id.get(observer_id)
+        if observer is None:
+            return answer_query(query, caps[observer_id], [], [], plan_result.availability_time_us)
+        before = len(observer.published)
+        answer, _at = observer.on_query(query, caps[observer_id], plan_result.availability_time_us)
+        for message in observer.published[before:]:
+            result = checker.check(encode(message), message.envelope.generation_time_us)
+            if result.state == "accepted" and isinstance(result.message, ObservationMessage):
+                try:
+                    store.add(result.message)
+                except ValueError:
+                    pass
+        return answer
+
+    raw = execute(queries, capabilities, {oid: (lambda q, i=oid: call(i, q)) for oid in caps})
+    answers = []
+    for answer in raw:
+        # Fast-path packets were admitted when they were fresh. The paused
+        # question cites those packets; it does not re-age them into STALE.
+        kept = [ref for ref in answer.evidence_refs if store.get(ref) is not None]
+        if answer.result == "detected" and not kept:
+            accepted = Answer(answer.query_id, answer.observer_id, "unavailable", None, None, ())
+        else:
+            accepted = Answer(answer.query_id, answer.observer_id, answer.result,
+                              answer.observed_time_us, answer.coverage_ref, tuple(kept))
+        answers.append(accepted)
+        event = accepted.to_event(plan_result.availability_time_us)
+        event["detail"]["mode"] = "snapshot"
+        events.append(event)
+    for query in queries:
+        event = query.to_event(plan_result.availability_time_us)
+        event["detail"]["question"] = DEMO_QUESTION
+        event["detail"]["mode"] = "snapshot"
+        events.append(event)
+    evidence = {}
+    for answer in answers:
+        for ref in answer.evidence_refs:
+            message = store.get(ref)
+            if not isinstance(message, ObservationMessage):
+                continue
+            evidence[ref] = {
+                "source_id": message.envelope.source_id,
+                "class": message.observation.cls.name,
+                "xy": [message.observation.xyz_m[0], message.observation.xyz_m[1]],
+                "capture_time_us": message.envelope.capture_time_us,
+            }
+    clock["us"] = plan_result.availability_time_us
+    try:
+        verdicts, judge = reasoner.judge(DEMO_QUESTION, queries, answers, evidence, clock["us"])
+        events.append(model_call_event(judge, "reasoner"))
+        for verdict in verdicts:
+            event = verdict.to_event(judge.availability_time_us)
+            if single and event["state"] == "corroborated":
+                event["state"] = "unverified"
+                event["detail"]["reason"] = (
+                    "Single physical observer. " + event["detail"]["reason"])
+                event["detail"]["evidence_refs"] = event["detail"]["evidence_refs"][:1]
+            events.append(event)
+        summary["verdicts"] = [v.state for v in verdicts]
+        clock["us"] = max(clock["us"], judge.availability_time_us)
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+    note = ("Only one demonstrated footprint covers the target, so the verdict stays single-source."
+            if single else "A second physical observer's footprint covers the target.")
+    events.append(_story(coverage_map, clock["us"] + 1, [], {
+        "beat": "question", "mode": "snapshot", "muse": True,
+        "title": "Paused snapshot Q&A",
+        "body": note + (" " + summary["error"] if summary.get("error") else ""),
+        "beliefs": [], "target_xy": list(target["xy"]),
+    }))
+    return {"events": events, "summary": summary, "single_source": single}
+
+
+def query_time(queries, query_id):
+    for query in queries:
+        if query.query_id == query_id:
+            return query.time_us
+    return None
+
+
+def _inject_ghost(coverage_map, store, anchors, key_seed, target, capture, events):
+    """A ghost 100 ms after the LiDAR scan, so the range proof can apply."""
+    from coopx.attacks import attack_anchors, plan_attack
+    from coopx.assess import Assessor
+    point = _free_cell(coverage_map, capture)
+    scene = {"target_xyz": (target["xy"][0], target["xy"][1], target["z"]),
+             "ego_xyz": (target["xy"][0], target["xy"][1], target["z"])}
+    if point is not None:
+        scene["free_xyz"] = point
+    when = capture + 100_000
+    plan = plan_attack("ghost_free", seed=key_seed, scene=scene, now_us=when)
+    _keys, extra = attack_anchors(plan, region=S3_REGION)
+    anchors.update(extra)
+    store.replace_anchors(anchors)
+    checker = Checker(anchors, ttl_us=S3_TTL_US)
+    contradicted = False
+    for packet in plan.packets:
+        result = checker.check(packet.raw, when)
+        delivery = PacketDelivery(packet.source, "ego", when, when, packet.raw,
+                                  packet.message_id, packet.message_type, packet_hash(packet.raw))
+        events.append(_check_event(delivery, result, when))
+        if result.state != "accepted" or not isinstance(result.message, ObservationMessage):
+            continue
+        try:
+            store.add(result.message)
+            coverage_map.add_observation(result.message, when)
+            contradicted = _range_rejects(store, coverage_map, result.message, when)
+        except ValueError:
+            contradicted = False
+    return {"witnesses": 1, "local_kept": True, "packets": len(plan.packets),
+            "contradicted": contradicted}
+
+
+def _range_rejects(store, coverage_map, message, when):
+    from coopx.assess import Assessor
+    from coopx.envelope import evidence_ref
+    assessor = Assessor(store, coverage_map)
+    for coverage in store.messages():
+        if isinstance(coverage, CoverageMessage) and coverage.content.free:
+            if assessor.range_contradiction(message, evidence_ref(coverage), when):
+                return True
+    return False
+
+
+def _demo_attacks(spec, target, ego_obs, remote, store, coverage_map, assessor, anchors,
+                  keys, key_seed, base, grid):
+    from coopx.attacks import attack_anchors, plan_attack
+    from coopx.envelope import evidence_ref
+    from coopx.eval.fusion import fuse
+    notes = {}
+    events = []
+    prepared = []
+    scene = {"target_xyz": (target["xy"][0], target["xy"][1], target["z"]),
+             "ego_xyz": ego_obs[0].observation.xyz_m if ego_obs else (target["xy"][0], target["xy"][1], 0.5)}
+    # While the fast-path observations are still inside their 5 s validity.
+    when = base + 1_000_000
+    free = _free_cell(coverage_map, when)
+    if free is not None:
+        scene["free_xyz"] = (free[0], free[1], 0.5)
+    for index, kind in enumerate(("sybil", "remote_clear")):
+        plan = plan_attack(kind, seed=key_seed, scene=scene, now_us=when)
+        _keys, extra = attack_anchors(plan, region=S3_REGION)
+        anchors.update(extra)
+        store.replace_anchors(anchors)
+        checker = Checker(anchors, ttl_us=S3_TTL_US)
+        admitted = []
+        for packet in plan.packets:
+            result = checker.check(packet.raw, when)
+            delivery = PacketDelivery(packet.source, "ego", when, when, packet.raw,
+                                      packet.message_id, packet.message_type, packet_hash(packet.raw))
+            events.append(_check_event(delivery, result, when))
+            if result.state == "accepted" and result.message is not None:
+                admitted.append(result.message)
+                try:
+                    store.add(result.message)
+                    if isinstance(result.message, CoverageMessage):
+                        coverage_map.add(result.message, when)
+                    elif isinstance(result.message, ObservationMessage):
+                        coverage_map.add_observation(result.message, when)
+                except ValueError:
+                    pass
+        obs = [m for m in admitted if isinstance(m, ObservationMessage)]
+        local = list(ego_obs)
+        try:
+            beliefs = fuse("witness", ego_observations=local, remote_admitted=remote + obs,
+                           store=store, coverage_map=coverage_map, assessor=assessor, now_us=when)
+        except Exception:
+            beliefs = []
+        witnesses = 0
+        if obs:
+            witnesses = max(store.independent_witnesses(m, obs) for m in obs)
+        kept = any(b.local and b.state != "contradicted" for b in beliefs)
+        notes[kind] = {"witnesses": witnesses, "local_kept": kept, "packets": len(plan.packets)}
+        title = {"ghost_free": "Ghost, Muse off", "sybil": "Sybil", "remote_clear": "Remote clear"}[kind]
+        body = {
+            "ghost_free": "Deterministic range check. Muse is off, so the rejection does not wait on a model.",
+            "sybil": f"Unanchored identities. Independent witnesses of the attack packets: {witnesses}.",
+            "remote_clear": "A remote free-space claim does not delete the car's own detection."
+                            if kept else "No local detection was present to protect.",
+        }[kind]
+        prepared.append((kind, title, body, beliefs, witnesses))
+    for index, (kind, title, body, beliefs, witnesses) in enumerate(prepared):
+        events.append(_story(coverage_map, when + 1 + index, [], {
+            "beat": kind, "mode": "causal", "muse": False, "title": title, "body": body,
+            "beliefs": [_public_belief(b) for b in beliefs],
+            "witnesses": witnesses, "target_xy": list(target["xy"]),
+        }))
+    events.append(make_event(t_replay_us=when + 10, type="observer_disconnected", source_id="rsu-1"))
+    events.append(_story(coverage_map, when + 11, [], {
+        "beat": "disconnect", "mode": "causal", "muse": False,
+        "title": "Observer disconnect",
+        "body": "The roadside observer is disconnected. Its coverage expires and the region is unknown, not free.",
+        "beliefs": [], "target_xy": list(target["xy"]),
+    }))
+    return events, notes
+
+
+def _free_cell(coverage_map, now_us):
+    """A point inside one free cell and that cell's own height band."""
+    now_us = max(now_us, coverage_map._now_us)
+    snap = coverage_map.snapshot(now_us)
+    free = {tuple(cell) for cell in snap.get("free") or []}
+    if not free or coverage_map.store is None:
+        return None
+    for message in coverage_map.store.messages():
+        if not isinstance(message, CoverageMessage):
+            continue
+        usable = message.content.free & free
+        if not usable:
+            continue
+        cell = min(usable)
+        centre = coverage_map.spec.cell_centre(cell)
+        lo, hi = message.content.height_band_m
+        return (centre[0], centre[1], (lo + hi) / 2)
+    return None
